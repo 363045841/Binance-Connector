@@ -60,7 +60,7 @@ $env:BINANCE_LIVE_TEST='1'; go test ./internal/binance -run '^TestLive' -v
 | POST | `/api/v1/market-data/instruments/search` | 现货品种搜索 |
 | POST | `/api/v1/market-data/bars` | 历史 K 线（UTC、exclusive 游标） |
 | POST | `/api/v1/market-data/trades` | 成交分页（`raw` / `aggregated`） |
-| POST | `/api/v1/market-data/trades/range` | 原始成交时间范围（左闭右开，完整覆盖） |
+| POST | `/api/v1/market-data/trades/range` | 聚合成交时间范围（左闭右开，完整覆盖） |
 | GET | `/api/v1/market-data/sources/binance/depth` | 盘口 REST 基线 |
 | GET | `/api/v1/market-data/sources/binance/stream` | 实时 K 线 SSE |
 | GET | `/api/v1/market-data/sources/binance/trades/stream` | 实时成交 SSE |
@@ -74,7 +74,8 @@ $env:BINANCE_LIVE_TEST='1'; go test ./internal/binance -run '^TestLive' -v
 - **成交方向**：`isBuyerMaker=true` → 主动卖（bid volume）；`false` → 主动买（ask volume）。
   缺少该标记时直接报错，不猜测方向。
 - **精度**：价格、数量以**十进制字符串**返回（`price`/`size`/`quoteSize`），避免前端浮点丢精度。
-- **raw vs aggregated**：两者 ID 空间不同（`tradeId` vs `aggTradeId`），互不混用。
+- **raw vs aggregated**：两者 ID 空间不同（`tradeId` vs `aggTradeId`），互不混用；
+  Footprint 统一使用 `aggregated`（同日同价的成交已合并，按价位买/卖量与原始逐笔等价）。
 - **成交量单位**：`baseAsset`（基础资产数量，非成交额）。
 - **盘口**：绝对数量增量，`0` 表示删除；序号断档即重新获取基线，绝不累加或跳过。
 - **归档时间**：2025-01-01 起为微秒，之前为毫秒；适配层统一到毫秒，并保留 `timestampMicros`。
@@ -109,5 +110,5 @@ internal/server/         — HTTP/SSE/NDJSON 路由与 envelope
 从指标面板添加 Footprint。价格行过密时增大“每行价格跳数”，放大柱宽后显示 Bid × Ask 数字。
 
 `/trades/range` 请求携带 `sourceId`、标准 `instrument` 引用、`from` 与 `to`（UTC 毫秒）。
-已结束日期读取校验归档；当日以 aggTrades.firstTradeId 定位原始游标，再连续分页原始成交。
-聚合成交只定位 ID，不参与数量统计。范围超过七天、250000 笔或 250 页时明确报错。
+已结束日期读取校验的 aggTrades 归档；当日以 aggTrades.startTime 定位聚合成交游标，再连续分页。
+聚合成交把同价同方向的成交合并，按价位买/卖量与原始逐笔等价。范围超过七天、250000 笔或 250 页时明确报错。

@@ -14,7 +14,7 @@ import (
 	"binanceconnector/internal/stream"
 )
 
-// TestLiveTradeRange 验证真实时间范围查询返回原始逐笔，并按连续成交 ID 覆盖区间。
+// TestLiveTradeRange 验证真实时间范围查询返回聚合成交，并按连续成交 ID 覆盖区间。
 func TestLiveTradeRange(t *testing.T) {
 	if os.Getenv("BINANCE_LIVE_TEST") != "1" {
 		t.Skip("设置 BINANCE_LIVE_TEST=1 执行外网验证")
@@ -45,12 +45,12 @@ func TestLiveTradeRange(t *testing.T) {
 		if index > 0 && id != previous+1 {
 			t.Fatalf("逐笔成交断序: %d -> %d", previous, id)
 		}
-		if trade.Timestamp < from || trade.Timestamp >= to || trade.Kind != "raw" {
+		if trade.Timestamp < from || trade.Timestamp >= to || trade.Kind != "aggregated" {
 			t.Fatalf("逐笔身份或时间不符: %+v", trade)
 		}
 		previous = id
 	}
-	t.Logf("真实十秒范围: %d 笔原始成交，首笔 %s，末笔 %s", len(trades), trades[0].TradeID, trades[len(trades)-1].TradeID)
+	t.Logf("真实十秒范围: %d 笔聚合成交，首笔 %s，末笔 %s", len(trades), trades[0].TradeID, trades[len(trades)-1].TradeID)
 }
 
 // TestLivePublicMarket 验证实际 REST/WS 成交可读取，不把本地夹具当成网络实测。

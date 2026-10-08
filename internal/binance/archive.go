@@ -1,4 +1,4 @@
-// 本文件下载校验 Binance 日成交归档，并逐行读取，不将全日成交装入内存。
+// 本文件下载校验 Binance 日聚合成交归档，并逐行读取，不将全日成交装入内存。
 package binance
 
 import (
@@ -31,7 +31,7 @@ func (c *Client) Archive(ctx context.Context, symbol, date string) (string, erro
 	if _, err := model.Symbol(symbol); err != nil {
 		return "", err
 	}
-	name := symbol + "-trades-" + date + ".zip"
+	name := symbol + "-aggTrades-" + date + ".zip"
 	filename := filepath.Join(c.Settings.CacheDir, name)
 	for {
 		c.archiveMu.Lock()
@@ -81,7 +81,7 @@ func (c *Client) archiveRequest(ctx context.Context, path string) (*http.Respons
 
 // downloadArchive 使用校验和与临时文件原子发布；不接受未完整下载的缓存。
 func (c *Client) downloadArchive(ctx context.Context, symbol, date, name, filename string) error {
-	base := "/data/spot/daily/trades/" + symbol + "/" + name
+	base := "/data/spot/daily/aggTrades/" + symbol + "/" + name
 	check, err := c.archiveRequest(ctx, base+".CHECKSUM")
 	if err != nil {
 		return err
@@ -181,10 +181,10 @@ func ReadArchive(ctx context.Context, filename, date string, emit func(model.Tra
 	}
 }
 
-// ParseArchiveTrade 解析官方 spot trades 的七列格式，不把 aggTrades 伪装成原始成交。
+// ParseArchiveTrade 解析官方 spot aggTrades 的八列格式，聚合成交身份独立于原始 tradeId。
 func ParseArchiveTrade(row []string, date string) (model.Trade, error) {
-	if len(row) != 7 {
-		return model.Trade{}, fmt.Errorf("原始成交应为七列")
+	if len(row) != 8 {
+		return model.Trade{}, fmt.Errorf("聚合成交应为八列")
 	}
 	day, parseErr := time.Parse("2006-01-02", date)
 	if parseErr != nil {
@@ -194,11 +194,11 @@ func ParseArchiveTrade(row []string, date string) (model.Trade, error) {
 	if err != nil {
 		return model.Trade{}, err
 	}
-	timestamp, err := strconv.ParseInt(row[4], 10, 64)
+	timestamp, err := strconv.ParseInt(row[5], 10, 64)
 	if err != nil {
 		return model.Trade{}, err
 	}
-	maker, err := strconv.ParseBool(row[5])
+	maker, err := strconv.ParseBool(row[6])
 	if err != nil {
 		return model.Trade{}, err
 	}
@@ -210,7 +210,12 @@ func ParseArchiveTrade(row []string, date string) (model.Trade, error) {
 	if timestamp < day.UnixMilli() || timestamp >= day.Add(24*time.Hour).UnixMilli() {
 		return model.Trade{}, fmt.Errorf("成交时间不在所请求 UTC 日期内")
 	}
-	t, err := model.NewTrade(id, timestamp, row[1], row[2], row[3], maker, "raw")
+	t, err := model.NewTrade(id, timestamp, row[1], row[2], "", maker, "aggregated")
+	if err != nil {
+		return model.Trade{}, err
+	}
 	t.TimestampMicros = strconv.FormatInt(micros, 10)
-	return t, err
+	t.FirstTradeID = row[3]
+	t.LastTradeID = row[4]
+	return t, nil
 }

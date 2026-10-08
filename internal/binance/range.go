@@ -1,4 +1,4 @@
-// 本文件按左闭右开时间范围返回原始成交；聚合成交仅用于定位原始 ID，不参与成交量统计。
+// 本文件按左闭右开时间范围返回聚合成交；当日按 aggTrades 游标分页，往日读取 aggTrades 归档。
 package binance
 
 import (
@@ -13,7 +13,7 @@ import (
 const maxRangeTrades = 250000
 const maxRangePages = 250
 
-// TradeRange 读取结束日期的校验归档及当日原始成交分页，不把部分覆盖当成完整范围。
+// TradeRange 读取结束日期的 aggTrades 归档及当日聚合成交分页，不把部分覆盖当成完整范围。
 func (c *Client) TradeRange(ctx context.Context, symbol string, from, to int64) ([]model.Trade, error) {
 	result := make([]model.Trade, 0)
 	appendTrade := func(t model.Trade) error {
@@ -43,7 +43,7 @@ func (c *Client) TradeRange(ctx context.Context, symbol string, from, to int64) 
 		if start < day.UnixMilli() {
 			start = day.UnixMilli()
 		}
-		// Binance aggTrades 返回的首个原始成交 ID 提供时间到游标的确定定位。
+		// aggTrades 返回的首个聚合成交 ID 提供时间到游标的确定定位。
 		var seed []model.Trade
 		for window := start; window < to && len(seed) == 0; {
 			end := window + time.Hour.Milliseconds()
@@ -60,18 +60,18 @@ func (c *Client) TradeRange(ctx context.Context, symbol string, from, to int64) 
 		if len(seed) == 0 {
 			continue
 		}
-		next, err := strconv.ParseInt(seed[0].FirstTradeID, 10, 64)
+		next, err := strconv.ParseInt(seed[0].TradeID, 10, 64)
 		if err != nil {
 			return nil, err
 		}
 		done := false
 		for page := 0; page < maxRangePages; page++ {
-			trades, err := c.Trades(ctx, symbol, &next, 1000)
+			trades, err := c.AggTrades(ctx, symbol, url.Values{"fromId": {strconv.FormatInt(next, 10)}, "limit": {"1000"}})
 			if err != nil {
 				return nil, err
 			}
 			if len(trades) == 0 {
-				return nil, fmt.Errorf("原始成交分页未覆盖范围尾部")
+				return nil, fmt.Errorf("聚合成交分页未覆盖范围尾部")
 			}
 			for _, t := range trades {
 				id, err := strconv.ParseInt(t.TradeID, 10, 64)
@@ -79,7 +79,7 @@ func (c *Client) TradeRange(ctx context.Context, symbol string, from, to int64) 
 					return nil, err
 				}
 				if id != next {
-					return nil, fmt.Errorf("原始成交断序: expected %d got %d", next, id)
+					return nil, fmt.Errorf("聚合成交断序: expected %d got %d", next, id)
 				}
 				next++
 				if t.Timestamp >= to {

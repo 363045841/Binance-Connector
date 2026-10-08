@@ -22,11 +22,11 @@ func archiveBytes(t *testing.T) []byte {
 	t.Helper()
 	var buffer bytes.Buffer
 	writer := zip.NewWriter(&buffer)
-	csv, err := writer.Create("BNBBTC-trades-2025-01-01.csv")
+	csv, err := writer.Create("BNBBTC-aggTrades-2025-01-01.csv")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = csv.Write([]byte("51175358,17.80180000,5.69000000,101.29224200,1735689600010866,True,True\n"))
+	_, err = csv.Write([]byte("51175358,17.80180000,5.69000000,100,105,1735689600010866,True,True\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestArchiveChecksumStreamingAndReuse(t *testing.T) {
 	var downloads atomic.Int32
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, ".CHECKSUM") {
-			_, _ = fmt.Fprintf(w, "%x BNBBTC-trades-2025-01-01.zip", hash)
+			_, _ = fmt.Fprintf(w, "%x BNBBTC-aggTrades-2025-01-01.zip", hash)
 			return
 		}
 		downloads.Add(1)

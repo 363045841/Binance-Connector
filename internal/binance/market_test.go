@@ -103,7 +103,7 @@ func TestBookCapacity(t *testing.T) {
 func TestArchiveTimestampUnits(t *testing.T) {
 	for _, tc := range []struct{ date, stamp, want, micros string }{{"2025-01-01", "1735689600010866", "1735689600010", "1735689600010866"}, {"2024-12-31", "1735603200010", "1735603200010", "1735603200010000"}} {
 		t.Run(tc.date, func(t *testing.T) {
-			row := []string{"51175358", "17.80180000", "5.69000000", "101.29224200", tc.stamp, "True", "True"}
+			row := []string{"51175358", "17.80180000", "5.69000000", "100", "105", tc.stamp, "True", "True"}
 			trade, err := ParseArchiveTrade(row, tc.date)
 			if err != nil {
 				t.Fatal(err)
@@ -116,7 +116,7 @@ func TestArchiveTimestampUnits(t *testing.T) {
 			}
 		})
 	}
-	if _, err := ParseArchiveTrade([]string{"1", "1", "1", "1", "1735689600000000", "true", "true"}, "2024-12-31"); err == nil {
+	if _, err := ParseArchiveTrade([]string{"1", "1", "1", "1", "1", "1735689600000000", "true", "true"}, "2024-12-31"); err == nil {
 		t.Fatal("单位错误不能默默产生未来成交")
 	}
 }

@@ -531,7 +531,7 @@ func (s *Server) sse(w http.ResponseWriter, r *http.Request, key stream.Key) {
 	}
 }
 
-// archive 流式返回日原始成交，只有终止 end.complete=true 表示完整读取成功。
+// archive 流式返回日聚合成交，只有终止 end.complete=true 表示完整读取成功。
 func (s *Server) archive(w http.ResponseWriter, r *http.Request) {
 	symbol, ok := querySymbol(w, r)
 	if !ok {
@@ -557,7 +557,7 @@ func (s *Server) archive(w http.ResponseWriter, r *http.Request) {
 		_ = control.SetWriteDeadline(time.Now().Add(s.Settings.WriteTimeout))
 		return encoder.Encode(value)
 	}
-	if err := write(map[string]any{"type": "begin", "sourceId": model.SourceID, "market": model.Market, "symbol": symbol, "date": date, "kind": "raw", "volumeUnit": "baseAsset"}); err != nil {
+	if err := write(map[string]any{"type": "begin", "sourceId": model.SourceID, "market": model.Market, "symbol": symbol, "date": date, "kind": "aggregated", "volumeUnit": "baseAsset"}); err != nil {
 		return
 	}
 	err = binance.ReadArchive(r.Context(), filename, date, func(t model.Trade) error {
