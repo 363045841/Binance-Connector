@@ -1,0 +1,6 @@
+# 本地配置、缓存和构建产物。
+.env
+data/
+bin/
+*.exe
+coverage.out
