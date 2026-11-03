@@ -75,26 +75,26 @@ func NewFrame(kind, symbol string) Frame {
 
 // Instrument 为 V1 品种目录的稳定标识及最小价格/数量步长。
 type Instrument struct {
-	ID           string            `json:"id"`
-	SourceID     string            `json:"sourceId"`
-	Symbol       string            `json:"symbol"`
-	Name         string            `json:"name"`
-	AssetClass   string            `json:"assetClass"`
-	Exchange     string            `json:"exchange"`
-	SessionID    string            `json:"sessionId"`
-	Currency     string            `json:"currency"`
-	TickSize     float64           `json:"tickSize"`
-	LotSize      float64           `json:"lotSize"`
-	ProviderRef  map[string]string `json:"providerRef"`
-	Capabilities map[string]any    `json:"capabilities"`
+	ID             string            `json:"id"`
+	SourceID       string            `json:"sourceId"`
+	Symbol         string            `json:"symbol"`
+	Name           string            `json:"name"`
+	InstrumentType string            `json:"instrumentType"`
+	Exchange       string            `json:"exchange"`
+	SessionID      string            `json:"sessionId"`
+	Currency       string            `json:"currency"`
+	TickSize       float64           `json:"tickSize"`
+	LotSize        float64           `json:"lotSize"`
+	ProviderRef    map[string]string `json:"providerRef"`
+	Capabilities   map[string]any    `json:"capabilities"`
 }
 
 // Capabilities 明确区分报价与真实成交，历史归档与实时分页均公开声明。
 func Capabilities() map[string]any {
 	return map[string]any{
-		"assetClasses": []string{"crypto"},
-		"bars":         map[string]any{"periods": PeriodNames, "adjustments": []string{"none"}, "barAggregations": []string{"original"}},
-		"liveBars":     true, "depth": true,
+		"instrumentTypes": []string{"crypto"},
+		"bars":            map[string]any{"periods": PeriodNames, "adjustments": []string{"none"}, "barAggregations": []string{"original"}},
+		"liveBars":        true, "depth": true,
 		"trades": map[string]any{"recent": true, "historyById": true, "archive": true, "live": true, "raw": true, "aggregated": true, "aggressorSide": "exchange", "volumeUnit": "baseAsset"},
 	}
 }

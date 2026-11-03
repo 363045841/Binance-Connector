@@ -192,7 +192,7 @@ func (c *Client) Instruments(ctx context.Context) ([]model.Instrument, error) {
 				}
 			}
 		}
-		result = append(result, model.Instrument{ID: "binance:spot:" + s.Symbol, SourceID: model.SourceID, Symbol: s.Symbol, Name: s.BaseAsset + " / " + s.QuoteAsset, AssetClass: "crypto", Exchange: "BINANCE", SessionID: "BINANCE_SPOT", Currency: s.QuoteAsset, TickSize: tick, LotSize: lot, ProviderRef: map[string]string{"symbol": s.Symbol, "market": model.Market}, Capabilities: model.Capabilities()})
+		result = append(result, model.Instrument{ID: "binance:spot:" + s.Symbol, SourceID: model.SourceID, Symbol: s.Symbol, Name: s.BaseAsset + " / " + s.QuoteAsset, InstrumentType: "crypto", Exchange: "BINANCE", SessionID: "BINANCE_SPOT", Currency: s.QuoteAsset, TickSize: tick, LotSize: lot, ProviderRef: map[string]string{"symbol": s.Symbol, "market": model.Market}, Capabilities: model.Capabilities()})
 	}
 	return result, nil
 }

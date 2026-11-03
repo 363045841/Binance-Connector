@@ -201,10 +201,10 @@ func (s *Server) probe(w http.ResponseWriter, r *http.Request) {
 // search 搜索现货目录，明确只返回 crypto 类型。
 func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		SourceID     string   `json:"sourceId"`
-		Keyword      string   `json:"keyword"`
-		Limit        int      `json:"limit"`
-		AssetClasses []string `json:"assetClasses,omitempty"`
+		SourceID        string   `json:"sourceId"`
+		Keyword         string   `json:"keyword"`
+		Limit           int      `json:"limit"`
+		InstrumentTypes []string `json:"instrumentTypes,omitempty"`
 	}
 	if !decode(w, r, &body) {
 		return
@@ -213,8 +213,8 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 		failure(w, "INVALID_REQUEST", "sourceId/limit/keyword 无效", 400, 0)
 		return
 	}
-	for _, asset := range body.AssetClasses {
-		if asset != "crypto" {
+	for _, instrumentType := range body.InstrumentTypes {
+		if instrumentType != "crypto" {
 			success(w, map[string]any{"items": []model.Instrument{}})
 			return
 		}
