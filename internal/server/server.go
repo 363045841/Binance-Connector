@@ -46,6 +46,7 @@ func New(c *binance.Client, s config.Settings) *Server {
 	mux.HandleFunc("POST "+prefix+"/trades/range", server.tradeRange)
 	mux.HandleFunc("GET "+prefix+"/sources/binance/depth", server.depth)
 	mux.HandleFunc("GET "+prefix+"/sources/binance/stream", server.liveBars)
+	mux.HandleFunc("GET "+prefix+"/sources/binance/quotes", server.liveQuotes)
 	mux.HandleFunc("GET "+prefix+"/sources/binance/trades/stream", server.liveTrades)
 	mux.HandleFunc("GET "+prefix+"/sources/binance/depth/stream", server.liveDepth)
 	mux.HandleFunc("GET "+prefix+"/sources/binance/trades/archive", server.archive)
@@ -394,6 +395,33 @@ func querySymbol(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return symbol, true
 }
 
+// queryInstruments 解析批量品种参数，返回交易对列表并保持请求顺序；重复 ID 只保留首个。
+func queryInstruments(w http.ResponseWriter, r *http.Request) ([]string, bool) {
+	symbols := make([]string, 0, 4)
+	seen := make(map[string]struct{})
+	for _, part := range strings.Split(r.URL.Query().Get("instruments"), ",") {
+		id := strings.TrimSpace(part)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		symbol, ok := model.SymbolFromInstrumentID(id)
+		if !ok {
+			failure(w, "INVALID_REQUEST", "无效的 instrumentId: "+id, 400, 0)
+			return nil, false
+		}
+		seen[id] = struct{}{}
+		symbols = append(symbols, symbol)
+	}
+	if len(symbols) == 0 {
+		failure(w, "INVALID_REQUEST", "instruments 不能为空", 400, 0)
+		return nil, false
+	}
+	return symbols, true
+}
+
 // depth 返回已知档位的直接 REST 基线，而不是常驻缓存的旧快照。
 func (s *Server) depth(w http.ResponseWriter, r *http.Request) {
 	symbol, ok := querySymbol(w, r)
@@ -424,7 +452,7 @@ func (s *Server) depth(w http.ResponseWriter, r *http.Request) {
 
 // liveBars 复用当前图表 V1 实时 K 线 URL 与帧类型。
 func (s *Server) liveBars(w http.ResponseWriter, r *http.Request) {
-	symbol, ok := querySymbol(w, r)
+	symbols, ok := queryInstruments(w, r)
 	if !ok {
 		return
 	}
@@ -437,7 +465,11 @@ func (s *Server) liveBars(w http.ResponseWriter, r *http.Request) {
 		failure(w, "UNSUPPORTED_CAPABILITY", "仅支持 original", 400, 0)
 		return
 	}
-	s.sse(w, r, stream.Key{Kind: "bars", Symbol: symbol, Period: period})
+	keys := make([]stream.Key, len(symbols))
+	for i, symbol := range symbols {
+		keys[i] = stream.Key{Kind: "bars", Symbol: symbol, Period: period}
+	}
+	s.sse(w, r, keys, nil)
 }
 
 // liveTrades 为 raw 和 aggregated 创建隔离的订阅及回放空间。
@@ -454,7 +486,7 @@ func (s *Server) liveTrades(w http.ResponseWriter, r *http.Request) {
 		failure(w, "INVALID_REQUEST", "kind 为 raw/aggregated", 400, 0)
 		return
 	}
-	s.sse(w, r, stream.Key{Kind: keyKind, Symbol: symbol})
+	s.sse(w, r, []stream.Key{{Kind: keyKind, Symbol: symbol}}, nil)
 }
 
 // liveDepth 订阅经过本地连续性校验的盘口快照与绝对量增量。
@@ -463,26 +495,49 @@ func (s *Server) liveDepth(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.sse(w, r, stream.Key{Kind: "depth", Symbol: symbol})
+	s.sse(w, r, []stream.Key{{Kind: "depth", Symbol: symbol}}, nil)
 }
 
-// sse 支持 Last-Event-ID；慢消费者被断开后从最后已接收帧恢复。
-func (s *Server) sse(w http.ResponseWriter, r *http.Request, key stream.Key) {
+// entryMapper 把上游帧改写成下游协议帧；nil 表示原样透传。
+type entryMapper func(stream.Entry) (stream.Entry, bool)
+
+// sse 把一个或多个 topic 合并到一条 SSE 连接。
+// 单流连接沿用 Last-Event-ID 续传；多流连接的游标无法用单个 ID 表达，改为重新快照。
+func (s *Server) sse(w http.ResponseWriter, r *http.Request, keys []stream.Key, mapper entryMapper) {
 	if _, ok := w.(http.Flusher); !ok {
 		failure(w, "UNSUPPORTED_CAPABILITY", "HTTP Transport 不支持流式响应", 500, 0)
 		return
 	}
-	sub, err := s.Hub.Subscribe(key, r.Header.Get("Last-Event-ID"))
-	if err != nil {
-		failure(w, "RESOURCE_EXHAUSTED", err.Error(), 503, 0)
-		return
+	subs := make([]*stream.Subscription, 0, len(keys))
+	defer func() {
+		for _, sub := range subs {
+			sub.Close()
+		}
+	}()
+	lastID := ""
+	if len(keys) == 1 {
+		lastID = r.Header.Get("Last-Event-ID")
 	}
-	defer sub.Close()
+	for _, key := range keys {
+		sub, err := s.Hub.Subscribe(key, lastID)
+		if err != nil {
+			failure(w, "RESOURCE_EXHAUSTED", err.Error(), 503, 0)
+			return
+		}
+		subs = append(subs, sub)
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	control := http.NewResponseController(w)
 	write := func(entry stream.Entry) error {
+		if mapper != nil {
+			mapped, ok := mapper(entry)
+			if !ok {
+				return nil
+			}
+			entry = mapped
+		}
 		_ = control.SetWriteDeadline(time.Now().Add(s.Settings.WriteTimeout))
 		if entry.ID != "" {
 			if _, err := fmt.Fprintf(w, "id: %s\n", entry.ID); err != nil {
@@ -501,10 +556,24 @@ func (s *Server) sse(w http.ResponseWriter, r *http.Request, key stream.Key) {
 	if err := control.Flush(); err != nil {
 		return
 	}
-	for _, entry := range sub.Replay() {
-		if err := write(entry); err != nil {
-			return
+	for _, sub := range subs {
+		for _, entry := range sub.Replay() {
+			if err := write(entry); err != nil {
+				return
+			}
 		}
+	}
+	events := make(chan stream.Entry)
+	for _, sub := range subs {
+		go func(sub *stream.Subscription) {
+			for entry := range sub.Events {
+				select {
+				case events <- entry:
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}(sub)
 	}
 	timer := time.NewTicker(s.Settings.KeepAlive)
 	defer timer.Stop()
@@ -512,10 +581,7 @@ func (s *Server) sse(w http.ResponseWriter, r *http.Request, key stream.Key) {
 		select {
 		case <-r.Context().Done():
 			return
-		case entry, ok := <-sub.Events:
-			if !ok {
-				return
-			}
+		case entry := <-events:
 			if err := write(entry); err != nil {
 				return
 			}

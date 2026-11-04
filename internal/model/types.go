@@ -50,7 +50,8 @@ type Frame struct {
 	Type           string  `json:"type"`
 	SourceID       string  `json:"sourceId"`
 	Market         string  `json:"market"`
-	Symbol         string  `json:"symbol"`
+	Symbol         string  `json:"symbol,omitempty"`
+	InstrumentID   string  `json:"instrumentId,omitempty"`
 	Timestamp      int64   `json:"timestamp,omitempty"`
 	Trades         []Trade `json:"trades,omitempty"`
 	Bar            *Bar    `json:"bar,omitempty"`
@@ -68,9 +69,34 @@ type Frame struct {
 	ToID           string  `json:"toId,omitempty"`
 }
 
-// NewFrame 填充所有流共用的来源身份。
+// NewFrame 填充所有流共用的来源身份；instrumentId 是协议里的稳定身份。
 func NewFrame(kind, symbol string) Frame {
-	return Frame{Type: kind, SourceID: SourceID, Market: Market, Symbol: symbol}
+	return Frame{Type: kind, SourceID: SourceID, Market: Market, Symbol: symbol, InstrumentID: InstrumentID(symbol)}
+}
+
+// instrumentPrefix 品种 ID 的稳定前缀；行情端点按它解析批量参数。
+const instrumentPrefix = SourceID + ":spot:"
+
+// InstrumentID 把交易对转换为协议里的稳定品种 ID。
+func InstrumentID(symbol string) string { return instrumentPrefix + symbol }
+
+// SymbolFromInstrumentID 从协议品种 ID 还原交易对；前缀不匹配时返回 false。
+func SymbolFromInstrumentID(value string) (string, bool) {
+	if !strings.HasPrefix(value, instrumentPrefix) {
+		return "", false
+	}
+	symbol, err := Symbol(strings.TrimPrefix(value, instrumentPrefix))
+	if err != nil {
+		return "", false
+	}
+	return symbol, true
+}
+
+// LiveBarsFrame 构造实时 K 线帧：身份是 instrumentId，周期属于连接参数。
+func LiveBarsFrame(kind, symbol string) Frame {
+	frame := NewFrame(kind, symbol)
+	frame.Symbol = ""
+	return frame
 }
 
 // Instrument 为 V1 品种目录的稳定标识及最小价格/数量步长。

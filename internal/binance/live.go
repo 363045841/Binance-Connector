@@ -73,7 +73,7 @@ func (c *Client) Run(ctx context.Context, key stream.Key, topic *stream.Topic) {
 	var lastTradeID *int64
 	for ctx.Err() == nil {
 		started := time.Now()
-		status := model.NewFrame("status", key.Symbol)
+		status := liveFrame(key.Kind, "status", key.Symbol)
 		status.Code = "CONNECTING"
 		topic.Publish(status, nil)
 		err := c.session(ctx, key, topic, &lastTradeID)
@@ -81,7 +81,7 @@ func (c *Client) Run(ctx context.Context, key stream.Key, topic *stream.Topic) {
 		if ctx.Err() != nil {
 			return
 		}
-		status = model.NewFrame("status", key.Symbol)
+		status = liveFrame(key.Kind, "status", key.Symbol)
 		status.Code = "DISCONNECTED"
 		status.Message = fmt.Sprint(err)
 		complete := false
@@ -128,13 +128,11 @@ func (c *Client) session(ctx context.Context, key stream.Key, topic *stream.Topi
 		if err != nil {
 			return err
 		}
-		f := model.NewFrame("snapshot", key.Symbol)
-		f.Period = key.Period
-		f.BarAggregation = "original"
+		f := model.LiveBarsFrame("snapshot", key.Symbol)
 		f.Bars = bars
 		topic.Publish(f, &f)
 	}
-	status := model.NewFrame("status", key.Symbol)
+	status := liveFrame(key.Kind, "status", key.Symbol)
 	status.Code = "CONNECTED"
 	topic.Publish(status, nil)
 	pending := make([]model.Trade, 0, 256)
@@ -191,7 +189,7 @@ func (c *Client) session(ctx context.Context, key stream.Key, topic *stream.Topi
 					flush()
 					missing, err := c.catchup(ctx, key, **lastID+1, id)
 					if err != nil {
-						f := model.NewFrame("status", key.Symbol)
+						f := liveFrame(key.Kind, "status", key.Symbol)
 						f.Code = "TRADE_GAP"
 						f.Message = err.Error()
 						f.FromID = strconv.FormatInt(**lastID+1, 10)
@@ -392,14 +390,18 @@ func publishBar(data []byte, key stream.Key, topic *stream.Topic) error {
 	if event.K.Closed {
 		typeName = "closed"
 	}
-	f := model.NewFrame(typeName, key.Symbol)
-	f.Period = key.Period
-	f.BarAggregation = "original"
+	f := model.LiveBarsFrame(typeName, key.Symbol)
 	f.Bar = &bar
-	bootstrap := model.NewFrame("snapshot", key.Symbol)
-	bootstrap.Period = key.Period
-	bootstrap.BarAggregation = "original"
+	bootstrap := model.LiveBarsFrame("snapshot", key.Symbol)
 	bootstrap.Bars = []model.Bar{bar}
 	topic.Publish(f, &bootstrap)
 	return nil
+}
+
+// liveFrame 让 K 线帧用 instrumentId 身份；成交流与盘口仍保留交易对字段。
+func liveFrame(kind, frameType, symbol string) model.Frame {
+	if kind == "bars" {
+		return model.LiveBarsFrame(frameType, symbol)
+	}
+	return model.NewFrame(frameType, symbol)
 }
