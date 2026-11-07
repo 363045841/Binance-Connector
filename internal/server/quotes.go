@@ -110,15 +110,15 @@ func tailBars(bars []model.Bar, n int) []model.Bar {
 	return append([]model.Bar(nil), bars[len(bars)-n:]...)
 }
 
-// liveQuotes 订阅日线实时流并投影成报价帧。
+// liveQuotes 订阅日线实时流并投影成报价帧；现货与永续各自一条订阅。
 func (s *Server) liveQuotes(w http.ResponseWriter, r *http.Request) {
-	symbols, ok := queryInstruments(w, r)
+	instruments, ok := queryInstruments(w, r)
 	if !ok {
 		return
 	}
-	keys := make([]stream.Key, len(symbols))
-	for i, symbol := range symbols {
-		keys[i] = stream.Key{Kind: "bars", Symbol: symbol, Period: "daily"}
+	keys := make([]stream.Key, len(instruments))
+	for i, instrument := range instruments {
+		keys[i] = stream.Key{Market: instrument.Market, Kind: "bars", Symbol: instrument.Symbol, Period: "daily"}
 	}
 	s.sse(w, r, keys, newQuoteProjection().mapEntry)
 }

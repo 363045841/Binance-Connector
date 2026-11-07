@@ -12,6 +12,7 @@ import (
 
 	"binanceconnector/internal/binance"
 	"binanceconnector/internal/config"
+	"binanceconnector/internal/model"
 	"binanceconnector/internal/server"
 )
 
@@ -28,7 +29,7 @@ func main() {
 	defer stop()
 	finished := make(chan error, 1)
 	go func() {
-		slog.Info("Binance Connector 启动", "address", settings.Address, "market", "spot")
+		slog.Info("Binance Connector 启动", "address", settings.Address, "markets", model.Markets())
 		finished <- httpServer.ListenAndServe()
 	}()
 	select {

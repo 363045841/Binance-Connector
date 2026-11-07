@@ -24,6 +24,7 @@ type DepthEvent struct {
 // Book 保留 REST 已知档位及后续更新；首次增量必须覆盖 lastUpdateId+1。
 type Book struct {
 	mu         sync.RWMutex
+	Market     string
 	Symbol     string
 	lastID     int64
 	bids, asks map[string]string
@@ -31,12 +32,12 @@ type Book struct {
 	maxLevels  int
 }
 
-// NewBook 从有效 REST 基线创建本地订单簿。
-func NewBook(symbol string, snapshot DepthSnapshot, maxLevels int) (*Book, error) {
+// NewBook 从有效 REST 基线创建本地订单簿；市场决定快照帧的身份前缀。
+func NewBook(market, symbol string, snapshot DepthSnapshot, maxLevels int) (*Book, error) {
 	if snapshot.LastID < 0 {
 		return nil, fmt.Errorf("无效快照序号")
 	}
-	b := &Book{Symbol: symbol, lastID: snapshot.LastID, bids: make(map[string]string), asks: make(map[string]string), maxLevels: maxLevels}
+	b := &Book{Market: market, Symbol: symbol, lastID: snapshot.LastID, bids: make(map[string]string), asks: make(map[string]string), maxLevels: maxLevels}
 	if err := validateLevels(snapshot.Bids, snapshot.Asks); err != nil {
 		return nil, err
 	}
@@ -129,7 +130,7 @@ func applyLevels(target map[string]string, levels []model.Level) {
 func (b *Book) Snapshot() model.Frame {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	f := model.NewFrame("depthSnapshot", b.Symbol)
+	f := model.NewFrame("depthSnapshot", b.Market, b.Symbol)
 	f.LastUpdateID = strconv.FormatInt(b.lastID, 10)
 	f.Bids = sortedLevels(b.bids, false)
 	f.Asks = sortedLevels(b.asks, true)

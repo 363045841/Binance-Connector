@@ -14,22 +14,28 @@ import (
 	"binanceconnector/internal/stream"
 )
 
+// liveSettings 读取真实配置，供 BINANCE_LIVE_TEST=1 的手工验证使用。
+func liveSettings(t *testing.T) config.Settings {
+	t.Helper()
+	s, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 // TestLiveTradeRange 验证真实时间范围查询返回聚合成交，并按连续成交 ID 覆盖区间。
 func TestLiveTradeRange(t *testing.T) {
 	if os.Getenv("BINANCE_LIVE_TEST") != "1" {
 		t.Skip("设置 BINANCE_LIVE_TEST=1 执行外网验证")
 	}
-	s, err := config.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := New(s)
+	c := New(liveSettings(t))
 	defer c.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	to := time.Now().Add(-5 * time.Second).UnixMilli()
 	from := to - 10000
-	trades, err := c.TradeRange(ctx, "BTCUSDT", from, to)
+	trades, err := c.TradeRange(ctx, model.MarketSpot, "BTCUSDT", from, to)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,34 +64,30 @@ func TestLivePublicMarket(t *testing.T) {
 	if os.Getenv("BINANCE_LIVE_TEST") != "1" {
 		t.Skip("设置 BINANCE_LIVE_TEST=1 执行外网验证")
 	}
-	s, err := config.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := New(s)
+	c := New(liveSettings(t))
 	defer c.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := c.Ping(ctx); err != nil {
+	if err := c.Ping(ctx, model.MarketSpot); err != nil {
 		t.Fatal("Binance REST 不可达:", err)
 	}
-	trades, err := c.Trades(ctx, "BTCUSDT", nil, 2)
+	trades, err := c.Trades(ctx, model.MarketSpot, "BTCUSDT", nil, 2)
 	if err != nil || len(trades) == 0 {
 		t.Fatalf("实时成交 REST 失败: %v", err)
 	}
 	from, _ := strconv.ParseInt(trades[0].TradeID, 10, 64)
 	// historicalTrades 仅在 api.binance.com 提供，该域名可能受地区/网络限制；
 	// 这里只做可达性探测，不把端点波动判为逻辑缺陷。
-	if history, err := c.Trades(ctx, "BTCUSDT", &from, 2); err != nil {
+	if history, err := c.Trades(ctx, model.MarketSpot, "BTCUSDT", &from, 2); err != nil {
 		t.Logf("按 ID 历史回补在当前网络不可用（可用归档替代）: %v", err)
 	} else if len(history) == 0 || history[0].TradeID != trades[0].TradeID {
 		t.Fatalf("历史成交返回身份不一致: %v", history)
 	}
-	depth, err := c.Depth(ctx, "BTCUSDT", 5)
+	depth, err := c.Depth(ctx, model.MarketSpot, "BTCUSDT", 5)
 	if err != nil || len(depth.Bids) == 0 || len(depth.Asks) == 0 {
 		t.Fatalf("盘口 REST 失败: %v", err)
 	}
-	socket, err := c.connect(ctx, "btcusdt@trade")
+	socket, err := c.connect(ctx, model.MarketSpot, "trades", "btcusdt@trade")
 	if err != nil {
 		t.Fatal("WebSocket 不可达:", err)
 	}
@@ -104,25 +106,66 @@ func TestLivePublicMarket(t *testing.T) {
 	}
 }
 
+// TestLivePerpMarket 验证永续新 WS 路由、聚合成交与资金费率/持仓量端点真实可用。
+func TestLivePerpMarket(t *testing.T) {
+	if os.Getenv("BINANCE_LIVE_TEST") != "1" {
+		t.Skip("设置 BINANCE_LIVE_TEST=1 执行外网验证")
+	}
+	c := New(liveSettings(t))
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := c.Ping(ctx, model.MarketPerp); err != nil {
+		t.Fatal("永续 REST 不可达:", err)
+	}
+	agg, err := c.AggTrades(ctx, model.MarketPerp, "BTCUSDT", nil)
+	if err != nil || len(agg) == 0 {
+		t.Fatalf("永续聚合成交失败: %v", err)
+	}
+	funding, err := c.PremiumIndex(ctx, model.MarketPerp, "BTCUSDT")
+	if err != nil || funding.NextFundingAt == 0 {
+		t.Fatalf("永续资金费率失败: %v", err)
+	}
+	interest, err := c.OpenInterest(ctx, model.MarketPerp, "BTCUSDT")
+	if err != nil || interest.Size == "" {
+		t.Fatalf("永续持仓量失败: %v", err)
+	}
+	// 永续 2026-04-23 后按流类型拆分路由，这里验证 /market 前缀确实收得到聚合成交。
+	socket, err := c.connect(ctx, model.MarketPerp, "aggTrades", "btcusdt@aggTrade")
+	if err != nil {
+		t.Fatal("永续 WebSocket 不可达:", err)
+	}
+	defer func() { socket.close(); <-socket.done }()
+	select {
+	case data := <-socket.messages:
+		trade, err := ParseLiveTrade(data, "aggTrades", "BTCUSDT")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("永续聚合成交: id=%s price=%s", trade.TradeID, trade.Price)
+	case err := <-socket.errors:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
 // TestLiveDepthAndBars 验证真实上游盘口完成连续同步，Kline 保留正确开盘时间和数量。
 func TestLiveDepthAndBars(t *testing.T) {
 	if os.Getenv("BINANCE_LIVE_TEST") != "1" {
 		t.Skip("设置 BINANCE_LIVE_TEST=1 执行外网验证")
 	}
-	s, err := config.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := liveSettings(t)
 	c := New(s)
 	defer c.Close()
 	hub := stream.NewHub(s, c.Run)
 	defer hub.Close()
-	depth, err := hub.Subscribe(stream.Key{Kind: "depth", Symbol: "BTCUSDT"}, "")
+	depth, err := hub.Subscribe(stream.Key{Market: model.MarketSpot, Kind: "depth", Symbol: "BTCUSDT"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer depth.Close()
-	bars, err := hub.Subscribe(stream.Key{Kind: "bars", Symbol: "BTCUSDT", Period: "1min"}, "")
+	bars, err := hub.Subscribe(stream.Key{Market: model.MarketSpot, Kind: "bars", Symbol: "BTCUSDT", Period: "1min"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,6 +187,9 @@ func TestLiveDepthAndBars(t *testing.T) {
 				baseline, _ = strconv.ParseInt(f.LastUpdateID, 10, 64)
 				if len(f.Bids) == 0 || len(f.Asks) == 0 {
 					t.Fatal("真实盘口无有效档位")
+				}
+				if f.InstrumentID != model.InstrumentID(model.MarketSpot, "BTCUSDT") {
+					t.Fatalf("盘口帧身份错误: %+v", f)
 				}
 			}
 			if f.Type == "depthDelta" {

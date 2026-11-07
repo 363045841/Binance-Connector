@@ -49,16 +49,25 @@ func apiSettings(t *testing.T) config.Settings {
 	return s
 }
 
+// editMarket 就地修改单个市场地址组；map 内是值类型，必须回写。
+func editMarket(s config.Settings, market string, edit func(*config.MarketSettings)) config.Settings {
+	settings := s.Markets[market]
+	edit(&settings)
+	s.Markets[market] = settings
+	return s
+}
+
 // TestValidationAndCapabilities 验证跨市场拒绝、V1 envelope 和健康检查。
 func TestValidationAndCapabilities(t *testing.T) {
-	s := apiSettings(t)
-	s.RESTURL = "http://127.0.0.1:1"
+	s := editMarket(apiSettings(t), model.MarketSpot, func(m *config.MarketSettings) {
+		m.REST = "http://127.0.0.1:1"
+	})
 	api := New(binance.New(s), s)
 	defer api.Close()
 	for _, tc := range []struct {
 		method, path, body string
 		status             int
-	}{{"GET", "/health", "", 200}, {"POST", prefix + "/trades", `{"sourceId":"binance","instrument":{"id":"binance:spot:BTCUSDT","symbol":"BTCUSDT","providerRef":{"market":"usdm"}},"limit":10}`, 400}, {"POST", prefix + "/bars", `{"sourceId":"binance","instrument":{"id":"binance:spot:BTCUSDT","symbol":"BTCUSDT"},"period":"quarterly","limit":10}`, 400}, {"GET", prefix + "/sources/binance/trades/stream?symbol=BTCUSDT%2Fbad", "", 400}, {"GET", prefix + "/sources/binance/trades/archive?symbol=BTCUSDT&date=bad", "", 400}} {
+	}{{"GET", "/health", "", 200}, {"POST", prefix + "/trades", `{"sourceId":"binance","instrument":{"id":"binance:spot:BTCUSDT","symbol":"BTCUSDT","providerRef":{"market":"usdm"}},"limit":10}`, 400}, {"POST", prefix + "/bars", `{"sourceId":"binance","instrument":{"id":"binance:spot:BTCUSDT","symbol":"BTCUSDT"},"period":"quarterly","limit":10}`, 400}, {"GET", prefix + "/sources/binance/trades/stream?symbol=BTCUSDT%2Fbad", "", 400}, {"GET", prefix + "/sources/binance/trades/archive?symbol=BTCUSDT&date=bad", "", 400}, {"GET", prefix + "/sources/binance/funding?symbol=BTCUSDT", "", 400}, {"GET", prefix + "/sources/binance/open-interest?symbol=BTCUSDT", "", 400}} {
 		t.Run(tc.path, func(t *testing.T) {
 			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
 			w := httptest.NewRecorder()
@@ -81,6 +90,105 @@ func TestValidationAndCapabilities(t *testing.T) {
 	api.ServeHTTP(w, req)
 	if w.Code != 403 {
 		t.Fatal("外部浏览器来源不应默认放行")
+	}
+}
+
+// TestInstrumentMarketResolution 验证市场只由 instrument.id 前缀决定，跨市场装配必须失败。
+func TestInstrumentMarketResolution(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		input    instrumentInput
+		wantMark string
+		wantErr  bool
+	}{
+		{"现货", instrumentInput{ID: "binance:spot:BTCUSDT"}, model.MarketSpot, false},
+		{"永续", instrumentInput{ID: "binance:perp:BTCUSDT"}, model.MarketPerp, false},
+		{"缺 ID", instrumentInput{Symbol: "BTCUSDT"}, "", true},
+		{"未知市场", instrumentInput{ID: "binance:usdm:BTCUSDT"}, "", true},
+		{"symbol 与 ID 不一致", instrumentInput{ID: "binance:perp:BTCUSDT", Symbol: "ETHUSDT"}, "", true},
+		{"providerRef.market 不一致", instrumentInput{ID: "binance:spot:BTCUSDT", ProviderRef: map[string]any{"market": "perp"}}, "", true},
+		{"providerRef.symbol 不一致", instrumentInput{ID: "binance:perp:BTCUSDT", ProviderRef: map[string]any{"symbol": "ETHUSDT"}}, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			market, _, err := resolveInstrument("binance", tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("应拒绝: %+v", tc.input)
+				}
+				return
+			}
+			if err != nil || market != tc.wantMark {
+				t.Fatalf("market = %q err=%v", market, err)
+			}
+		})
+	}
+}
+
+// TestSearchMergesMarkets 验证搜索省略 market 时合并现货与永续目录：
+// 同一代码在两个市场各返回一条独立身份，显式声明 market 时只返回该市场。
+func TestSearchMergesMarkets(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v3/exchangeInfo":
+			_, _ = w.Write([]byte(`{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.00001"}]},{"symbol":"ETHBTC","status":"TRADING","baseAsset":"ETH","quoteAsset":"BTC","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.0001"},{"filterType":"LOT_SIZE","stepSize":"0.0001"}]},{"symbol":"AAAUSDT","status":"TRADING","baseAsset":"AAA","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"1"}]},{"symbol":"BBBUSDT","status":"TRADING","baseAsset":"BBB","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"1"}]}]}`))
+		case "/fapi/v1/exchangeInfo":
+			// 季度合约不是永续，必须被目录过滤掉，不能出现在搜索结果里。
+			_, _ = w.Write([]byte(`{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","contractType":"PERPETUAL","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001"}]},{"symbol":"AAAUSDT","status":"TRADING","baseAsset":"AAA","quoteAsset":"USDT","contractType":"PERPETUAL","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.0001"},{"filterType":"LOT_SIZE","stepSize":"1"}]},{"symbol":"BBBUSDT","status":"TRADING","baseAsset":"BBB","quoteAsset":"USDT","contractType":"PERPETUAL","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.0001"},{"filterType":"LOT_SIZE","stepSize":"1"}]},{"symbol":"BTCUSDT_241227","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","contractType":"CURRENT_QUARTER","filters":[]}]}`))
+		default:
+			t.Errorf("意外路径: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	s := editMarket(apiSettings(t), model.MarketSpot, func(m *config.MarketSettings) { m.REST = up.URL })
+	s = editMarket(s, model.MarketPerp, func(m *config.MarketSettings) { m.REST = up.URL })
+	api := New(binance.New(s), s)
+	defer api.Close()
+	search := func(body string) []model.Instrument {
+		w := httptest.NewRecorder()
+		api.ServeHTTP(w, httptest.NewRequest("POST", prefix+"/instruments/search", strings.NewReader(body)))
+		if w.Code != 200 {
+			t.Fatalf("搜索失败: %d %s", w.Code, w.Body.String())
+		}
+		var envelope struct {
+			Data struct {
+				Items []model.Instrument `json:"items"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		return envelope.Data.Items
+	}
+	ids := func(items []model.Instrument) []string {
+		out := make([]string, 0, len(items))
+		for _, item := range items {
+			out = append(out, item.ID)
+		}
+		return out
+	}
+	// 省略 market 时两个市场都搜，同代码现货在前（与「不带后缀即现货」一致）。
+	if got := strings.Join(ids(search(`{"sourceId":"binance","keyword":"BTCUSDT","limit":10}`)), ","); got != "binance:spot:BTCUSDT,binance:perp:BTCUSDT" {
+		t.Fatalf("跨市场搜索应同时返回现货与永续，实际 %s", got)
+	}
+	// 显式限定市场时只返回该市场。
+	if got := strings.Join(ids(search(`{"sourceId":"binance","keyword":"BTCUSDT","market":"perp","limit":10}`)), ","); got != "binance:perp:BTCUSDT" {
+		t.Fatalf("限定永续市场不应返回现货，实际 %s", got)
+	}
+	// 截断发生在合并之后：limit=2 时两个市场的 BTCUSDT 都在，不会被截掉其中一个。
+	if got := strings.Join(ids(search(`{"sourceId":"binance","keyword":"BTCUSDT","limit":2}`)), ","); got != "binance:spot:BTCUSDT,binance:perp:BTCUSDT" {
+		t.Fatalf("截断必须在合并之后，实际 %s", got)
+	}
+	// 合并后按代码排序再截断：limit=3 时 AAAUSDT 的现货与永续都出现，
+	// 说明名额没有被现货目录占满（先拼现货再截断会漏掉永续）。
+	if got := strings.Join(ids(search(`{"sourceId":"binance","keyword":"","limit":3}`)), ","); got != "binance:spot:AAAUSDT,binance:perp:AAAUSDT,binance:spot:BBBUSDT" {
+		t.Fatalf("截断前必须按代码排序，实际 %s", got)
+	}
+	// 未知市场仍然显式拒绝，不退化成跨市场搜索。
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, httptest.NewRequest("POST", prefix+"/instruments/search", strings.NewReader(`{"sourceId":"binance","keyword":"BTCUSDT","market":"usdm","limit":10}`)))
+	if w.Code != 400 {
+		t.Fatalf("未知市场应拒绝，实际 %d", w.Code)
 	}
 }
 
@@ -110,9 +218,11 @@ func TestSSETradeCatchup(t *testing.T) {
 		_, _, _ = conn.ReadMessage()
 	}))
 	defer up.Close()
-	s := apiSettings(t)
-	s.WSURL = "ws" + strings.TrimPrefix(up.URL, "http")
-	s.HistoricalURL = up.URL
+	s := editMarket(apiSettings(t), model.MarketSpot, func(m *config.MarketSettings) {
+		m.WS = "ws" + strings.TrimPrefix(up.URL, "http")
+		m.Historical = up.URL
+		m.REST = up.URL
+	})
 	api := New(binance.New(s), s)
 	defer api.Close()
 	local := httptest.NewServer(api)

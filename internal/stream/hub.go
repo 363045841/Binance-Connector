@@ -16,8 +16,8 @@ import (
 	"binanceconnector/internal/model"
 )
 
-// Key 隔离不同成交模式、盘口及 K 线周期。
-type Key struct{ Kind, Symbol, Period string }
+// Key 隔离市场、成交模式、盘口及 K 线周期；同一交易对在两个市场是不同的上游订阅。
+type Key struct{ Market, Kind, Symbol, Period string }
 
 // Entry 为 Connector 进程内有序帧，ID 在上游重连时继续递增。
 type Entry struct {
@@ -128,7 +128,7 @@ func (h *Hub) Subscribe(key Key, lastID string) (*Subscription, error) {
 				}
 			}
 		} else {
-			f := model.NewFrame("status", key.Symbol)
+			f := model.NewFrame("status", key.Market, key.Symbol)
 			f.Code = "REPLAY_GAP"
 			f.Message = "回放窗口不可用，请按 tradeId 回补或重新获取盘口快照"
 			complete := false

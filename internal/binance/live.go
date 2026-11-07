@@ -24,10 +24,37 @@ type socket struct {
 	done     chan struct{}
 }
 
-// connect 建立官方 raw stream；自动响应服务器 ping，并响应 context 关闭。
-func (c *Client) connect(ctx context.Context, name string) (*socket, error) {
+// streamPath 返回市场的 WebSocket 路径前缀。
+// 现货沿用统一的 /ws/；永续自 2026-04-23 起按流类型拆分路由，
+// 盘口与原始成交在高频 /public 前缀，聚合成交与 K 线在常规 /market 前缀，混放会被静默忽略。
+func streamPath(market, kind string) (string, error) {
+	switch market {
+	case model.MarketSpot:
+		return "/ws/", nil
+	case model.MarketPerp:
+		switch kind {
+		case "depth", "trades":
+			return "/public/ws/", nil
+		case "aggTrades", "bars":
+			return "/market/ws/", nil
+		}
+	}
+	return "", fmt.Errorf("不支持的市场或订阅类型: %s/%s", market, kind)
+}
+
+// connect 建立官方 raw stream；路由由市场与订阅类型共同决定。
+// 自动响应服务器 ping，并响应 context 关闭。
+func (c *Client) connect(ctx context.Context, market, kind, name string) (*socket, error) {
+	settings, ok := c.Settings.Markets[market]
+	if !ok {
+		return nil, fmt.Errorf("不支持的市场: %s", market)
+	}
+	prefix, err := streamPath(market, kind)
+	if err != nil {
+		return nil, err
+	}
 	dialer := websocket.Dialer{Proxy: ProxyFunc(c.Settings), HandshakeTimeout: c.Settings.HTTPTimeout}
-	conn, resp, err := dialer.DialContext(ctx, strings.TrimRight(c.Settings.WSURL, "/")+"/ws/"+name, nil)
+	conn, resp, err := dialer.DialContext(ctx, strings.TrimRight(settings.WS, "/")+prefix+name, nil)
 	if err != nil && resp != nil && resp.Body != nil {
 		resp.Body.Close()
 	}
@@ -73,7 +100,7 @@ func (c *Client) Run(ctx context.Context, key stream.Key, topic *stream.Topic) {
 	var lastTradeID *int64
 	for ctx.Err() == nil {
 		started := time.Now()
-		status := liveFrame(key.Kind, "status", key.Symbol)
+		status := liveFrame(key, "status")
 		status.Code = "CONNECTING"
 		topic.Publish(status, nil)
 		err := c.session(ctx, key, topic, &lastTradeID)
@@ -81,7 +108,7 @@ func (c *Client) Run(ctx context.Context, key stream.Key, topic *stream.Topic) {
 		if ctx.Err() != nil {
 			return
 		}
-		status = liveFrame(key.Kind, "status", key.Symbol)
+		status = liveFrame(key, "status")
 		status.Code = "DISCONNECTED"
 		status.Message = fmt.Sprint(err)
 		complete := false
@@ -115,7 +142,7 @@ func (c *Client) session(ctx context.Context, key stream.Key, topic *stream.Topi
 	default:
 		return fmt.Errorf("未知订阅类型")
 	}
-	s, err := c.connect(ctx, name)
+	s, err := c.connect(ctx, key.Market, key.Kind, name)
 	if err != nil {
 		return err
 	}
@@ -124,15 +151,15 @@ func (c *Client) session(ctx context.Context, key stream.Key, topic *stream.Topi
 		return c.depthSession(ctx, key, topic, s)
 	}
 	if key.Kind == "bars" {
-		bars, err := c.Bars(ctx, key.Symbol, key.Period, 2, nil)
+		bars, err := c.Bars(ctx, key.Market, key.Symbol, key.Period, 2, nil)
 		if err != nil {
 			return err
 		}
-		f := model.LiveBarsFrame("snapshot", key.Symbol)
+		f := model.LiveBarsFrame("snapshot", key.Market, key.Symbol)
 		f.Bars = bars
 		topic.Publish(f, &f)
 	}
-	status := liveFrame(key.Kind, "status", key.Symbol)
+	status := liveFrame(key, "status")
 	status.Code = "CONNECTED"
 	topic.Publish(status, nil)
 	pending := make([]model.Trade, 0, 256)
@@ -140,7 +167,7 @@ func (c *Client) session(ctx context.Context, key stream.Key, topic *stream.Topi
 		if len(pending) == 0 {
 			return
 		}
-		f := model.NewFrame("trades", key.Symbol)
+		f := model.NewFrame("trades", key.Market, key.Symbol)
 		f.Trades = pending
 		topic.Publish(f, nil)
 		pending = make([]model.Trade, 0, 256)
@@ -189,7 +216,7 @@ func (c *Client) session(ctx context.Context, key stream.Key, topic *stream.Topi
 					flush()
 					missing, err := c.catchup(ctx, key, **lastID+1, id)
 					if err != nil {
-						f := liveFrame(key.Kind, "status", key.Symbol)
+						f := liveFrame(key, "status")
 						f.Code = "TRADE_GAP"
 						f.Message = err.Error()
 						f.FromID = strconv.FormatInt(**lastID+1, 10)
@@ -256,9 +283,9 @@ func (c *Client) catchup(ctx context.Context, key stream.Key, start, exclusiveEn
 		var trades []model.Trade
 		var err error
 		if key.Kind == "trades" {
-			trades, err = c.Trades(ctx, key.Symbol, &next, 1000)
+			trades, err = c.Trades(ctx, key.Market, key.Symbol, &next, 1000)
 		} else {
-			trades, err = c.AggTrades(ctx, key.Symbol, url.Values{"fromId": {strconv.FormatInt(next, 10)}, "limit": {"1000"}})
+			trades, err = c.AggTrades(ctx, key.Market, key.Symbol, url.Values{"fromId": {strconv.FormatInt(next, 10)}, "limit": {"1000"}})
 		}
 		if err != nil {
 			return nil, err
@@ -293,11 +320,11 @@ func (c *Client) catchup(ctx context.Context, key stream.Key, start, exclusiveEn
 
 // depthSession 先缓冲 WebSocket 再获取 REST，首个事件必须覆盖基线下一序号。
 func (c *Client) depthSession(ctx context.Context, key stream.Key, topic *stream.Topic, s *socket) error {
-	snapshot, err := c.Depth(ctx, key.Symbol, c.Settings.SnapshotLimit)
+	snapshot, err := c.Depth(ctx, key.Market, key.Symbol, c.Settings.SnapshotLimit)
 	if err != nil {
 		return err
 	}
-	book, err := NewBook(key.Symbol, snapshot, c.Settings.MaxBookLevels)
+	book, err := NewBook(key.Market, key.Symbol, snapshot, c.Settings.MaxBookLevels)
 	if err != nil {
 		return err
 	}
@@ -340,7 +367,7 @@ func (c *Client) depthSession(ctx context.Context, key stream.Key, topic *stream
 				topic.Publish(frame, nil)
 				continue
 			}
-			f := model.NewFrame("depthDelta", key.Symbol)
+			f := model.NewFrame("depthDelta", key.Market, key.Symbol)
 			f.Timestamp = event.EventTime
 			f.FirstUpdateID = strconv.FormatInt(event.FirstID, 10)
 			f.LastUpdateID = strconv.FormatInt(event.FinalID, 10)
@@ -390,18 +417,18 @@ func publishBar(data []byte, key stream.Key, topic *stream.Topic) error {
 	if event.K.Closed {
 		typeName = "closed"
 	}
-	f := model.LiveBarsFrame(typeName, key.Symbol)
+	f := model.LiveBarsFrame(typeName, key.Market, key.Symbol)
 	f.Bar = &bar
-	bootstrap := model.LiveBarsFrame("snapshot", key.Symbol)
+	bootstrap := model.LiveBarsFrame("snapshot", key.Market, key.Symbol)
 	bootstrap.Bars = []model.Bar{bar}
 	topic.Publish(f, &bootstrap)
 	return nil
 }
 
 // liveFrame 让 K 线帧用 instrumentId 身份；成交流与盘口仍保留交易对字段。
-func liveFrame(kind, frameType, symbol string) model.Frame {
-	if kind == "bars" {
-		return model.LiveBarsFrame(frameType, symbol)
+func liveFrame(key stream.Key, frameType string) model.Frame {
+	if key.Kind == "bars" {
+		return model.LiveBarsFrame(frameType, key.Market, key.Symbol)
 	}
-	return model.NewFrame(frameType, symbol)
+	return model.NewFrame(frameType, key.Market, key.Symbol)
 }
