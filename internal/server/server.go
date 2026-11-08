@@ -63,14 +63,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.S
 // Close 释放共享订阅及上游连接。
 func (s *Server) Close() { s.Hub.Close(); s.Client.Close() }
 
-// cors 允许本机开发来源；外部部署通过反向代理控制跨域来源。
+// cors 放行本机页面与显式配置的外部来源，并在 PNA 预检上补充允许头。
 func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" {
-			u, err := url.Parse(origin)
-			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || (u.Hostname() != "localhost" && u.Hostname() != "127.0.0.1" && u.Hostname() != "::1") {
-				failure(w, "ACCESS_DENIED", "仅允许本机浏览器来源，请由部署代理配置远程 CORS", 403, 0)
+			if !s.allowedOrigin(origin) {
+				failure(w, "ACCESS_DENIED", "来源未放行，请通过 BINANCE_ALLOWED_ORIGINS 配置", 403, 0)
 				return
 			}
 			w.Header().Set("Access-Control-Allow-Origin", origin)
@@ -78,6 +77,11 @@ func (s *Server) cors(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Last-Event-ID")
 			w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
+			// Chrome 对公开页面访问本机的请求会先发 PNA 预检，缺少该头会被拦截。
+			if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
+				w.Header().Set("Access-Control-Allow-Private-Network", "true")
+				w.Header().Add("Vary", "Access-Control-Request-Private-Network")
+			}
 		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -85,6 +89,25 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// allowedOrigin 判断浏览器来源：loopback 始终允许，其余按配置精确匹配。
+func (s *Server) allowedOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+		u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	if u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1" {
+		return true
+	}
+	normalized := strings.ToLower(u.Scheme + "://" + u.Host)
+	for _, allowed := range s.Settings.AllowedOrigins {
+		if normalized == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 // requestID 为 envelope 生成追踪 ID，不接受客户端任意反射值。

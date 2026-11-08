@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -14,6 +15,8 @@ type Settings struct {
 	Address, RESTURL, HistoricalURL, WSURL, ArchiveURL, CacheDir, APIKey, Proxy                     string
 	HTTPTimeout, ArchiveTimeout, WriteTimeout, KeepAlive, IdleGrace, ReconnectMin, ReconnectMax     time.Duration
 	WeightPerMinute, BufferSize, ReplaySize, MaxStreams, SnapshotLimit, CatchupPages, MaxBookLevels int
+	// AllowedOrigins 是 loopback 之外额外放行的浏览器来源；loopback 始终允许。
+	AllowedOrigins []string
 }
 
 // ProxyOff 表示显式直连；BINANCE_PROXY 设为该值时忽略默认代理。
@@ -30,6 +33,11 @@ func Load() (Settings, error) {
 		CacheDir:      text("BINANCE_CACHE_DIR", "data/archives"), APIKey: os.Getenv("BINANCE_API_KEY"),
 		Proxy: text("BINANCE_PROXY", text("HTTPS_PROXY", text("HTTP_PROXY", "http://127.0.0.1:6666"))),
 	}
+	origins, err := parseOrigins("BINANCE_ALLOWED_ORIGINS")
+	if err != nil {
+		return s, err
+	}
+	s.AllowedOrigins = origins
 	for _, item := range []struct {
 		key      string
 		dst      *time.Duration
@@ -96,6 +104,24 @@ func Load() (Settings, error) {
 		}
 	}
 	return s, nil
+}
+
+// parseOrigins 解析逗号分隔的浏览器来源白名单，只接受 http/https 的纯 origin。
+func parseOrigins(key string) ([]string, error) {
+	var origins []string
+	for _, item := range strings.Split(os.Getenv(key), ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		u, err := url.Parse(item)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+			u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return nil, fmt.Errorf("%s 中的 %q 不是合法来源，需形如 https://host[:port]", key, item)
+		}
+		origins = append(origins, strings.ToLower(u.Scheme+"://"+u.Host))
+	}
+	return origins, nil
 }
 
 // text 返回显式环境值或默认值。
