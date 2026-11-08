@@ -23,6 +23,8 @@ func settingsForTest(t *testing.T) config.Settings {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 上游均为本机测试服务器，不经默认代理。
+	s.Proxy = config.ProxyOff
 	s.CacheDir = t.TempDir()
 	return s
 }
