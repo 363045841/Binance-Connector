@@ -1,4 +1,7 @@
 // Package server 提供 V1 行情 REST、SSE 与历史成交 NDJSON，所有流共用 Hub。
+// 同一 Binance 源下的现货（spot）与 USDT-M 永续（perp）是两个市场：
+// 品种 ID 前缀（binance:spot: / binance:perp:）是唯一身份来源，
+// 查询参数 market 只在没有品种 ID 可用的端点（如单 symbol 流）上使用。
 package server
 
 import (
@@ -37,7 +40,7 @@ func New(c *binance.Client, s config.Settings) *Server {
 	server := &Server{Client: c, Hub: stream.NewHub(s, c.Run), Settings: s}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		success(w, map[string]any{"status": "ok", "sourceId": model.SourceID, "market": model.Market})
+		success(w, map[string]any{"status": "ok", "sourceId": model.SourceID, "markets": model.Markets()})
 	})
 	mux.HandleFunc("GET "+prefix+"/sources/binance/probe", server.probe)
 	mux.HandleFunc("POST "+prefix+"/instruments/search", server.search)
@@ -50,6 +53,8 @@ func New(c *binance.Client, s config.Settings) *Server {
 	mux.HandleFunc("GET "+prefix+"/sources/binance/trades/stream", server.liveTrades)
 	mux.HandleFunc("GET "+prefix+"/sources/binance/depth/stream", server.liveDepth)
 	mux.HandleFunc("GET "+prefix+"/sources/binance/trades/archive", server.archive)
+	mux.HandleFunc("GET "+prefix+"/sources/binance/funding", server.funding)
+	mux.HandleFunc("GET "+prefix+"/sources/binance/open-interest", server.openInterest)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		failure(w, "NOT_FOUND", "接口不存在或请求方法不匹配", 404, 0)
 	})
@@ -190,42 +195,61 @@ type instrumentInput struct {
 	ProviderRef map[string]any `json:"providerRef,omitempty"`
 }
 
-// symbolFor 校验来源、市场和稳定 ID，防止跨市场混用成交与背景 K 线。
-func symbolFor(source string, instrument instrumentInput) (string, error) {
+// resolveInstrument 校验来源、市场与稳定 ID，防止跨市场混用成交与背景 K 线。
+// 市场只由 ID 前缀决定；providerRef 若出现必须与 ID 一致，而不是另立一套真相。
+func resolveInstrument(source string, instrument instrumentInput) (market, symbol string, err error) {
 	if source != model.SourceID {
-		return "", fmt.Errorf("sourceId 必须为 binance")
+		return "", "", fmt.Errorf("sourceId 必须为 binance")
 	}
-	symbol, err := model.Symbol(instrument.Symbol)
-	if err != nil {
-		return "", err
+	market, symbol, ok := model.SymbolFromInstrumentID(instrument.ID)
+	if !ok {
+		return "", "", fmt.Errorf("instrument.id 必须为 binance:spot:<symbol> 或 binance:perp:<symbol>")
 	}
-	if instrument.ID != "binance:spot:"+symbol {
-		return "", fmt.Errorf("instrument.id 必须为 binance:spot:%s", symbol)
+	if instrument.Symbol != "" {
+		normalized, err := model.Symbol(instrument.Symbol)
+		if err != nil {
+			return "", "", err
+		}
+		if normalized != symbol {
+			return "", "", fmt.Errorf("instrument.symbol 与 instrument.id 不一致")
+		}
 	}
-	if market, ok := instrument.ProviderRef["market"]; ok && market != model.Market {
-		return "", fmt.Errorf("当前只支持 spot 市场")
+	if raw, ok := instrument.ProviderRef["market"]; ok && raw != market {
+		return "", "", fmt.Errorf("providerRef.market 与 instrument.id 的市场不一致")
 	}
 	if value, ok := instrument.ProviderRef["symbol"]; ok && value != symbol {
-		return "", fmt.Errorf("providerRef.symbol 与 symbol 不一致")
+		return "", "", fmt.Errorf("providerRef.symbol 与 symbol 不一致")
 	}
-	return symbol, nil
+	return market, symbol, nil
 }
 
 // probe 报告真实 REST 探测结果，不把本机启动等同于上游可用。
 func (s *Server) probe(w http.ResponseWriter, r *http.Request) {
+	market, ok := queryMarket(w, r)
+	if !ok {
+		return
+	}
 	started := time.Now()
-	status, message := "online", "Binance spot REST 可达；流连接状态由 SSE status 报告"
-	if err := s.Client.Ping(r.Context()); err != nil {
+	status, message := "online", fmt.Sprintf("Binance %s REST 可达；流连接状态由 SSE status 报告", market)
+	if err := s.Client.Ping(r.Context(), market); err != nil {
 		status = "offline"
 		message = err.Error()
 	}
-	success(w, map[string]any{"status": status, "checkedAt": time.Now().UnixMilli(), "latencyMs": time.Since(started).Milliseconds(), "message": message, "market": model.Market, "capabilities": model.Capabilities()})
+	capabilities := model.Capabilities()
+	if market == model.MarketPerp {
+		capabilities = model.PerpCapabilities()
+	}
+	success(w, map[string]any{"status": status, "checkedAt": time.Now().UnixMilli(), "latencyMs": time.Since(started).Milliseconds(), "message": message, "market": market, "capabilities": capabilities})
 }
 
-// search 搜索现货目录，明确只返回 crypto 类型。
+// search 搜索品种目录；market 为空时合并全部市场，显式声明时只搜该市场。
+// 目录本身是跨市场的：同一代码在现货与永续各有一条独立身份，搜索必须能同时看到两者，
+// 否则用户不加后缀就永远搜不到永续。任一市场查询失败即整体失败，
+// 不返回半个市场的结果——那会被误读成「该品种不存在」。
 func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SourceID        string   `json:"sourceId"`
+		Market          string   `json:"market,omitempty"`
 		Keyword         string   `json:"keyword"`
 		Limit           int      `json:"limit"`
 		InstrumentTypes []string `json:"instrumentTypes,omitempty"`
@@ -234,8 +258,17 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.SourceID != model.SourceID || body.Limit < 1 || body.Limit > 100 || len(body.Keyword) > 128 {
-		failure(w, "INVALID_REQUEST", "sourceId/limit/keyword 无效", 400, 0)
+		failure(w, "INVALID_REQUEST", "sourceId/market/limit/keyword 无效", 400, 0)
 		return
+	}
+	// 空 market 表示不限市场，按声明顺序逐个查询后合并。
+	markets := model.Markets()
+	if body.Market != "" {
+		if !model.ValidMarket(body.Market) {
+			failure(w, "INVALID_REQUEST", "sourceId/market/limit/keyword 无效", 400, 0)
+			return
+		}
+		markets = []string{body.Market}
 	}
 	for _, instrumentType := range body.InstrumentTypes {
 		if instrumentType != "crypto" {
@@ -243,23 +276,28 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	items, err := s.Client.Instruments(r.Context())
-	if err != nil {
-		upstream(w, err)
-		return
-	}
 	keyword := strings.ToUpper(strings.TrimSpace(body.Keyword))
-	out := make([]model.Instrument, 0, body.Limit)
-	sort.Slice(items, func(i, j int) bool { return items[i].Symbol < items[j].Symbol })
-	for _, item := range items {
-		if strings.Contains(item.Symbol, keyword) || strings.Contains(strings.ToUpper(item.Name), keyword) {
-			out = append(out, item)
-			if len(out) == body.Limit {
-				break
+	matches := make([]model.Instrument, 0, body.Limit*len(markets))
+	for _, market := range markets {
+		items, err := s.Client.Instruments(r.Context(), market)
+		if err != nil {
+			upstream(w, err)
+			return
+		}
+		for _, item := range items {
+			if strings.Contains(item.Symbol, keyword) || strings.Contains(strings.ToUpper(item.Name), keyword) {
+				matches = append(matches, item)
 			}
 		}
 	}
-	success(w, map[string]any{"items": out})
+	// 合并后按代码排序再截断，而不是「先拼现货再截断」：同一代码在两个市场各有一条
+	// 独立身份，排序让它们相邻，截断就不会只留下其中一个。稳定排序保留市场声明顺序
+	//（现货在前），与「不带后缀即现货」的输入约定一致。
+	sort.SliceStable(matches, func(i, j int) bool { return matches[i].Symbol < matches[j].Symbol })
+	if len(matches) > body.Limit {
+		matches = matches[:body.Limit]
+	}
+	success(w, map[string]any{"items": matches})
 }
 
 // bars 获取 exclusive 游标之前的 UTC 原生历史 K 线。
@@ -276,7 +314,7 @@ func (s *Server) bars(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &body) {
 		return
 	}
-	symbol, err := symbolFor(body.SourceID, body.Instrument)
+	market, symbol, err := resolveInstrument(body.SourceID, body.Instrument)
 	if err != nil {
 		failure(w, "INVALID_REQUEST", err.Error(), 400, 0)
 		return
@@ -290,10 +328,10 @@ func (s *Server) bars(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if (body.Adjustment != "" && body.Adjustment != "none") || (body.BarAggregation != "" && body.BarAggregation != "original") {
-		failure(w, "UNSUPPORTED_CAPABILITY", "现货仅支持 none / original", 400, 0)
+		failure(w, "UNSUPPORTED_CAPABILITY", "仅支持 none / original", 400, 0)
 		return
 	}
-	items, err := s.Client.Bars(r.Context(), symbol, body.Period, body.Limit, body.Before)
+	items, err := s.Client.Bars(r.Context(), market, symbol, body.Period, body.Limit, body.Before)
 	if err != nil {
 		upstream(w, err)
 		return
@@ -302,7 +340,7 @@ func (s *Server) bars(w http.ResponseWriter, r *http.Request) {
 	if len(items) == 0 {
 		older = "exhausted"
 	}
-	success(w, map[string]any{"instrumentId": body.Instrument.ID, "period": body.Period, "adjustment": "none", "barAggregation": "original", "timezone": "UTC", "volumeUnit": "baseAsset", "items": items, "olderData": older})
+	success(w, map[string]any{"instrumentId": body.Instrument.ID, "market": market, "period": body.Period, "adjustment": "none", "barAggregation": "original", "timezone": "UTC", "volumeUnit": "baseAsset", "items": items, "olderData": older})
 }
 
 // trades 获取有界成交批次，raw 的游标是 tradeId，aggregated 的游标是 aggTradeId。
@@ -319,7 +357,7 @@ func (s *Server) trades(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &body) {
 		return
 	}
-	symbol, err := symbolFor(body.SourceID, body.Instrument)
+	market, symbol, err := resolveInstrument(body.SourceID, body.Instrument)
 	if err != nil {
 		failure(w, "INVALID_REQUEST", err.Error(), 400, 0)
 		return
@@ -354,7 +392,7 @@ func (s *Server) trades(w http.ResponseWriter, r *http.Request) {
 	}
 	var items []model.Trade
 	if body.Kind == "raw" {
-		items, err = s.Client.Trades(r.Context(), symbol, from, body.Limit)
+		items, err = s.Client.Trades(r.Context(), market, symbol, from, body.Limit)
 	} else {
 		q := url.Values{"limit": {strconv.Itoa(body.Limit)}}
 		if from != nil {
@@ -366,7 +404,7 @@ func (s *Server) trades(w http.ResponseWriter, r *http.Request) {
 		if body.End != nil {
 			q.Set("endTime", strconv.FormatInt(*body.End, 10))
 		}
-		items, err = s.Client.AggTrades(r.Context(), symbol, q)
+		items, err = s.Client.AggTrades(r.Context(), market, symbol, q)
 	}
 	if err != nil {
 		upstream(w, err)
@@ -377,10 +415,22 @@ func (s *Server) trades(w http.ResponseWriter, r *http.Request) {
 		id, _ := strconv.ParseInt(items[len(items)-1].TradeID, 10, 64)
 		next = strconv.FormatInt(id+1, 10)
 	}
-	success(w, map[string]any{"sourceId": model.SourceID, "instrumentId": body.Instrument.ID, "market": model.Market, "kind": body.Kind, "volumeUnit": "baseAsset", "items": items, "nextFromId": next, "coverage": map[string]any{"status": "page", "completeRange": false}})
+	success(w, map[string]any{"sourceId": model.SourceID, "instrumentId": body.Instrument.ID, "market": market, "kind": body.Kind, "volumeUnit": "baseAsset", "items": items, "nextFromId": next, "coverage": map[string]any{"status": "page", "completeRange": false}})
 }
 
-// querySymbol 统一校验流和快照的交易对参数。
+// queryMarket 解析单品种端点上的市场参数；缺省为现货，未知市场直接拒绝。
+func queryMarket(w http.ResponseWriter, r *http.Request) (string, bool) {
+	market := r.URL.Query().Get("market")
+	if market == "" {
+		return model.MarketSpot, true
+	}
+	if !model.ValidMarket(market) {
+		failure(w, "INVALID_REQUEST", "未知市场: "+market, 400, 0)
+		return "", false
+	}
+	return market, true
+}
+
 // tradeRange 返回具有确定覆盖边界的原始成交，失败时不发布半份统计数据。
 func (s *Server) tradeRange(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -392,7 +442,7 @@ func (s *Server) tradeRange(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &body) {
 		return
 	}
-	symbol, err := symbolFor(body.SourceID, body.Instrument)
+	market, symbol, err := resolveInstrument(body.SourceID, body.Instrument)
 	if err != nil {
 		failure(w, "INVALID_REQUEST", err.Error(), 400, 0)
 		return
@@ -401,14 +451,15 @@ func (s *Server) tradeRange(w http.ResponseWriter, r *http.Request) {
 		failure(w, "INVALID_REQUEST", "成交时间范围必须为已发生的左闭右开区间，最多七天", 400, 0)
 		return
 	}
-	items, err := s.Client.TradeRange(r.Context(), symbol, body.From, body.To)
+	items, err := s.Client.TradeRange(r.Context(), market, symbol, body.From, body.To)
 	if err != nil {
 		upstream(w, err)
 		return
 	}
-	success(w, map[string]any{"items": items, "range": map[string]int64{"from": body.From, "to": body.To}, "complete": true})
+	success(w, map[string]any{"items": items, "market": market, "range": map[string]int64{"from": body.From, "to": body.To}, "complete": true})
 }
 
+// querySymbol 校验单品种端点的 symbol 参数，市场由调用方用 queryMarket 取得。
 func querySymbol(w http.ResponseWriter, r *http.Request) (string, bool) {
 	symbol, err := model.Symbol(r.URL.Query().Get("symbol"))
 	if err != nil {
@@ -418,9 +469,15 @@ func querySymbol(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return symbol, true
 }
 
-// queryInstruments 解析批量品种参数，返回交易对列表并保持请求顺序；重复 ID 只保留首个。
-func queryInstruments(w http.ResponseWriter, r *http.Request) ([]string, bool) {
-	symbols := make([]string, 0, 4)
+// marketSymbol 是批量流订阅解析出的市场与交易对，二者一起才构成订阅身份。
+type marketSymbol struct {
+	Market string
+	Symbol string
+}
+
+// queryInstruments 解析批量品种参数，保持请求顺序并去掉重复 ID。
+func queryInstruments(w http.ResponseWriter, r *http.Request) ([]marketSymbol, bool) {
+	out := make([]marketSymbol, 0, 4)
 	seen := make(map[string]struct{})
 	for _, part := range strings.Split(r.URL.Query().Get("instruments"), ",") {
 		id := strings.TrimSpace(part)
@@ -430,23 +487,27 @@ func queryInstruments(w http.ResponseWriter, r *http.Request) ([]string, bool) {
 		if _, ok := seen[id]; ok {
 			continue
 		}
-		symbol, ok := model.SymbolFromInstrumentID(id)
+		market, symbol, ok := model.SymbolFromInstrumentID(id)
 		if !ok {
 			failure(w, "INVALID_REQUEST", "无效的 instrumentId: "+id, 400, 0)
 			return nil, false
 		}
 		seen[id] = struct{}{}
-		symbols = append(symbols, symbol)
+		out = append(out, marketSymbol{Market: market, Symbol: symbol})
 	}
-	if len(symbols) == 0 {
+	if len(out) == 0 {
 		failure(w, "INVALID_REQUEST", "instruments 不能为空", 400, 0)
 		return nil, false
 	}
-	return symbols, true
+	return out, true
 }
 
 // depth 返回已知档位的直接 REST 基线，而不是常驻缓存的旧快照。
 func (s *Server) depth(w http.ResponseWriter, r *http.Request) {
+	market, ok := queryMarket(w, r)
+	if !ok {
+		return
+	}
 	symbol, ok := querySymbol(w, r)
 	if !ok {
 		return
@@ -460,12 +521,12 @@ func (s *Server) depth(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
-	snap, err := s.Client.Depth(r.Context(), symbol, limit)
+	snap, err := s.Client.Depth(r.Context(), market, symbol, limit)
 	if err != nil {
 		upstream(w, err)
 		return
 	}
-	book, err := binance.NewBook(symbol, snap, s.Settings.MaxBookLevels)
+	book, err := binance.NewBook(market, symbol, snap, s.Settings.MaxBookLevels)
 	if err != nil {
 		upstream(w, err)
 		return
@@ -475,7 +536,7 @@ func (s *Server) depth(w http.ResponseWriter, r *http.Request) {
 
 // liveBars 复用当前图表 V1 实时 K 线 URL 与帧类型。
 func (s *Server) liveBars(w http.ResponseWriter, r *http.Request) {
-	symbols, ok := queryInstruments(w, r)
+	instruments, ok := queryInstruments(w, r)
 	if !ok {
 		return
 	}
@@ -488,15 +549,19 @@ func (s *Server) liveBars(w http.ResponseWriter, r *http.Request) {
 		failure(w, "UNSUPPORTED_CAPABILITY", "仅支持 original", 400, 0)
 		return
 	}
-	keys := make([]stream.Key, len(symbols))
-	for i, symbol := range symbols {
-		keys[i] = stream.Key{Kind: "bars", Symbol: symbol, Period: period}
+	keys := make([]stream.Key, len(instruments))
+	for i, instrument := range instruments {
+		keys[i] = stream.Key{Market: instrument.Market, Kind: "bars", Symbol: instrument.Symbol, Period: period}
 	}
 	s.sse(w, r, keys, nil)
 }
 
 // liveTrades 为 raw 和 aggregated 创建隔离的订阅及回放空间。
 func (s *Server) liveTrades(w http.ResponseWriter, r *http.Request) {
+	market, ok := queryMarket(w, r)
+	if !ok {
+		return
+	}
 	symbol, ok := querySymbol(w, r)
 	if !ok {
 		return
@@ -509,16 +574,20 @@ func (s *Server) liveTrades(w http.ResponseWriter, r *http.Request) {
 		failure(w, "INVALID_REQUEST", "kind 为 raw/aggregated", 400, 0)
 		return
 	}
-	s.sse(w, r, []stream.Key{{Kind: keyKind, Symbol: symbol}}, nil)
+	s.sse(w, r, []stream.Key{{Market: market, Kind: keyKind, Symbol: symbol}}, nil)
 }
 
 // liveDepth 订阅经过本地连续性校验的盘口快照与绝对量增量。
 func (s *Server) liveDepth(w http.ResponseWriter, r *http.Request) {
+	market, ok := queryMarket(w, r)
+	if !ok {
+		return
+	}
 	symbol, ok := querySymbol(w, r)
 	if !ok {
 		return
 	}
-	s.sse(w, r, []stream.Key{{Kind: "depth", Symbol: symbol}}, nil)
+	s.sse(w, r, []stream.Key{{Market: market, Kind: "depth", Symbol: symbol}}, nil)
 }
 
 // entryMapper 把上游帧改写成下游协议帧；nil 表示原样透传。
@@ -622,6 +691,10 @@ func (s *Server) sse(w http.ResponseWriter, r *http.Request, keys []stream.Key, 
 
 // archive 流式返回日聚合成交，只有终止 end.complete=true 表示完整读取成功。
 func (s *Server) archive(w http.ResponseWriter, r *http.Request) {
+	market, ok := queryMarket(w, r)
+	if !ok {
+		return
+	}
 	symbol, ok := querySymbol(w, r)
 	if !ok {
 		return
@@ -632,7 +705,7 @@ func (s *Server) archive(w http.ResponseWriter, r *http.Request) {
 		failure(w, "INVALID_REQUEST", "date 必须是 UTC 已结束日期 YYYY-MM-DD", 400, 0)
 		return
 	}
-	filename, err := s.Client.Archive(r.Context(), symbol, date)
+	filename, err := s.Client.Archive(r.Context(), market, symbol, date)
 	if err != nil {
 		upstream(w, err)
 		return
@@ -646,10 +719,10 @@ func (s *Server) archive(w http.ResponseWriter, r *http.Request) {
 		_ = control.SetWriteDeadline(time.Now().Add(s.Settings.WriteTimeout))
 		return encoder.Encode(value)
 	}
-	if err := write(map[string]any{"type": "begin", "sourceId": model.SourceID, "market": model.Market, "symbol": symbol, "date": date, "kind": "aggregated", "volumeUnit": "baseAsset"}); err != nil {
+	if err := write(map[string]any{"type": "begin", "sourceId": model.SourceID, "market": market, "symbol": symbol, "date": date, "kind": "aggregated", "volumeUnit": "baseAsset"}); err != nil {
 		return
 	}
-	err = binance.ReadArchive(r.Context(), filename, date, func(t model.Trade) error {
+	err = binance.ReadArchive(r.Context(), filename, market, date, func(t model.Trade) error {
 		if err := write(map[string]any{"type": "trade", "trade": t}); err != nil {
 			return err
 		}
@@ -666,4 +739,62 @@ func (s *Server) archive(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = write(map[string]any{"type": "end", "complete": true, "count": count})
 	_ = control.Flush()
+}
+
+// funding 返回永续资金费率历史；现货没有等价概念，明确拒绝而不是返回空数组。
+func (s *Server) funding(w http.ResponseWriter, r *http.Request) {
+	market, ok := queryMarket(w, r)
+	if !ok {
+		return
+	}
+	if market != model.MarketPerp {
+		failure(w, "UNSUPPORTED_CAPABILITY", "资金费率只存在于永续市场", 400, 0)
+		return
+	}
+	symbol, ok := querySymbol(w, r)
+	if !ok {
+		return
+	}
+	limit := 1
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 1000 {
+			failure(w, "INVALID_REQUEST", "limit 为 1–1000", 400, 0)
+			return
+		}
+		limit = n
+	}
+	current, err := s.Client.PremiumIndex(r.Context(), market, symbol)
+	if err != nil {
+		upstream(w, err)
+		return
+	}
+	history, err := s.Client.FundingRate(r.Context(), market, symbol, limit)
+	if err != nil {
+		upstream(w, err)
+		return
+	}
+	success(w, map[string]any{"instrumentId": model.InstrumentID(market, symbol), "market": market, "markPrice": current.MarkPrice, "rate": current.Rate, "nextFundingAt": current.NextFundingAt, "timestamp": current.Timestamp, "items": history})
+}
+
+// openInterest 返回永续未平仓量快照，单位为基础资产。
+func (s *Server) openInterest(w http.ResponseWriter, r *http.Request) {
+	market, ok := queryMarket(w, r)
+	if !ok {
+		return
+	}
+	if market != model.MarketPerp {
+		failure(w, "UNSUPPORTED_CAPABILITY", "未平仓量只存在于永续市场", 400, 0)
+		return
+	}
+	symbol, ok := querySymbol(w, r)
+	if !ok {
+		return
+	}
+	current, err := s.Client.OpenInterest(r.Context(), market, symbol)
+	if err != nil {
+		upstream(w, err)
+		return
+	}
+	success(w, map[string]any{"instrumentId": model.InstrumentID(market, symbol), "market": market, "size": current.Size, "volumeUnit": "baseAsset", "timestamp": current.Timestamp})
 }

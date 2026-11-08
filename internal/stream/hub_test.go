@@ -47,18 +47,23 @@ func receive[T any](t *testing.T, ch <-chan T) T {
 	}
 }
 
+// frameFor 按订阅身份构造帧，保证帧里的市场与 key 一致。
+func frameFor(kind string, key Key) model.Frame {
+	return model.NewFrame(kind, key.Market, key.Symbol)
+}
+
 // TestReplayAndSharedSubscription 验证同品种共用上游，Last-Event-ID 排他回放。
 func TestReplayAndSharedSubscription(t *testing.T) {
 	h, started, _ := hubFixture(t, 16, 4, 1)
-	key := Key{Kind: "trades", Symbol: "BTCUSDT"}
+	key := Key{Market: model.MarketSpot, Kind: "trades", Symbol: "BTCUSDT"}
 	first, err := h.Subscribe(key, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	topic := receive(t, started)
-	topic.Publish(model.NewFrame("trades", key.Symbol), nil)
+	topic.Publish(frameFor("trades", key), nil)
 	entry := receive(t, first.Events)
-	topic.Publish(model.NewFrame("status", key.Symbol), nil)
+	topic.Publish(frameFor("status", key), nil)
 	secondEntry := receive(t, first.Events)
 	second, err := h.Subscribe(key, entry.ID)
 	if err != nil {
@@ -72,8 +77,13 @@ func TestReplayAndSharedSubscription(t *testing.T) {
 		t.Fatal("同 key 不应启动第二个上游")
 	default:
 	}
-	if _, err := h.Subscribe(Key{Kind: "depth", Symbol: key.Symbol}, ""); err == nil {
+	depth := Key{Market: model.MarketSpot, Kind: "depth", Symbol: key.Symbol}
+	if _, err := h.Subscribe(depth, ""); err == nil {
 		t.Fatal("不同能力应占用独立订阅预算")
+	}
+	perp := Key{Market: model.MarketPerp, Kind: "trades", Symbol: key.Symbol}
+	if _, err := h.Subscribe(perp, ""); err == nil {
+		t.Fatal("不同市场应占用独立订阅预算")
 	}
 	first.Close()
 	second.Close()
@@ -82,18 +92,22 @@ func TestReplayAndSharedSubscription(t *testing.T) {
 // TestReplayGapAndSnapshot 验证过期游标明确报告 gap，盘口以当前快照恢复。
 func TestReplayGapAndSnapshot(t *testing.T) {
 	h, started, _ := hubFixture(t, 16, 1, 1)
-	key := Key{Kind: "depth", Symbol: "BTCUSDT"}
+	key := Key{Market: model.MarketSpot, Kind: "depth", Symbol: "BTCUSDT"}
 	sub, err := h.Subscribe(key, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	topic := receive(t, started)
-	topic.Publish(model.NewFrame("status", key.Symbol), nil)
+	topic.Publish(frameFor("status", key), nil)
 	old := receive(t, sub.Events)
 	for i := 0; i < 3; i++ {
-		topic.Publish(model.NewFrame("depthDelta", key.Symbol), nil)
+		topic.Publish(frameFor("depthDelta", key), nil)
 	}
-	topic.SetSnapshot(func() model.Frame { f := model.NewFrame("depthSnapshot", key.Symbol); f.LastUpdateID = "162"; return f })
+	topic.SetSnapshot(func() model.Frame {
+		f := frameFor("depthSnapshot", key)
+		f.LastUpdateID = "162"
+		return f
+	})
 	recovered, err := h.Subscribe(key, old.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -116,21 +130,21 @@ func TestReplayGapAndSnapshot(t *testing.T) {
 // TestSlowConsumerAndIdleRelease 验证满队列断开且上游最终取消，不静默漏帧。
 func TestSlowConsumerAndIdleRelease(t *testing.T) {
 	h, started, stopped := hubFixture(t, 1, 8, 1)
-	key := Key{Kind: "trades", Symbol: "BTCUSDT"}
+	key := Key{Market: model.MarketSpot, Kind: "trades", Symbol: "BTCUSDT"}
 	sub, err := h.Subscribe(key, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	topic := receive(t, started)
-	topic.Publish(model.NewFrame("trades", key.Symbol), nil)
-	topic.Publish(model.NewFrame("trades", key.Symbol), nil)
+	topic.Publish(frameFor("trades", key), nil)
+	topic.Publish(frameFor("trades", key), nil)
 	_ = receive(t, sub.Events)
 	if _, ok := <-sub.Events; ok {
 		t.Fatal("慢消费者应被断开")
 	}
 	sub.Close()
 	receive(t, stopped)
-	next, err := h.Subscribe(Key{Kind: "depth", Symbol: key.Symbol}, "")
+	next, err := h.Subscribe(Key{Market: model.MarketSpot, Kind: "depth", Symbol: key.Symbol}, "")
 	if err != nil {
 		t.Fatal("空闲资源未回收:", err)
 	}
@@ -141,7 +155,7 @@ func TestSlowConsumerAndIdleRelease(t *testing.T) {
 // TestConcurrentPublishAndSubscribe 验证并发注册/注销与广播无数据竞争。
 func TestConcurrentPublishAndSubscribe(t *testing.T) {
 	h, started, _ := hubFixture(t, 512, 32, 1)
-	key := Key{Kind: "trades", Symbol: "BTCUSDT"}
+	key := Key{Market: model.MarketPerp, Kind: "trades", Symbol: "BTCUSDT"}
 	anchor, err := h.Subscribe(key, "")
 	if err != nil {
 		t.Fatal(err)
@@ -157,7 +171,7 @@ func TestConcurrentPublishAndSubscribe(t *testing.T) {
 				if err == nil {
 					s.Close()
 				}
-				topic.Publish(model.NewFrame("status", key.Symbol), nil)
+				topic.Publish(frameFor("status", key), nil)
 			}
 		}()
 	}

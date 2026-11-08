@@ -14,7 +14,7 @@ const maxRangeTrades = 250000
 const maxRangePages = 250
 
 // TradeRange 读取结束日期的 aggTrades 归档及当日聚合成交分页，不把部分覆盖当成完整范围。
-func (c *Client) TradeRange(ctx context.Context, symbol string, from, to int64) ([]model.Trade, error) {
+func (c *Client) TradeRange(ctx context.Context, market, symbol string, from, to int64) ([]model.Trade, error) {
 	result := make([]model.Trade, 0)
 	appendTrade := func(t model.Trade) error {
 		if t.Timestamp < from || t.Timestamp >= to {
@@ -30,11 +30,11 @@ func (c *Client) TradeRange(ctx context.Context, symbol string, from, to int64) 
 	for day := time.UnixMilli(from).UTC().Truncate(24 * time.Hour); day.UnixMilli() < to; day = day.Add(24 * time.Hour) {
 		if day.Before(today) {
 			date := day.Format("2006-01-02")
-			path, err := c.Archive(ctx, symbol, date)
+			path, err := c.Archive(ctx, market, symbol, date)
 			if err != nil {
 				return nil, err
 			}
-			if err := ReadArchive(ctx, path, date, appendTrade); err != nil {
+			if err := ReadArchive(ctx, path, market, date, appendTrade); err != nil {
 				return nil, err
 			}
 			continue
@@ -51,7 +51,7 @@ func (c *Client) TradeRange(ctx context.Context, symbol string, from, to int64) 
 				end = to
 			}
 			var err error
-			seed, err = c.AggTrades(ctx, symbol, url.Values{"startTime": {strconv.FormatInt(window, 10)}, "endTime": {strconv.FormatInt(end-1, 10)}, "limit": {"1"}})
+			seed, err = c.AggTrades(ctx, market, symbol, url.Values{"startTime": {strconv.FormatInt(window, 10)}, "endTime": {strconv.FormatInt(end-1, 10)}, "limit": {"1"}})
 			if err != nil {
 				return nil, err
 			}
@@ -66,7 +66,7 @@ func (c *Client) TradeRange(ctx context.Context, symbol string, from, to int64) 
 		}
 		done := false
 		for page := 0; page < maxRangePages; page++ {
-			trades, err := c.AggTrades(ctx, symbol, url.Values{"fromId": {strconv.FormatInt(next, 10)}, "limit": {"1000"}})
+			trades, err := c.AggTrades(ctx, market, symbol, url.Values{"fromId": {strconv.FormatInt(next, 10)}, "limit": {"1000"}})
 			if err != nil {
 				return nil, err
 			}

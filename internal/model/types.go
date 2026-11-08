@@ -9,7 +9,6 @@ import (
 )
 
 const SourceID = "binance"
-const Market = "spot"
 
 // Periods 映射图表标准周期到 Binance 原生 UTC 周期。
 var Periods = map[string]string{"1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m", "60min": "1h", "4h": "4h", "daily": "1d", "weekly": "1w", "monthly": "1M"}
@@ -67,34 +66,32 @@ type Frame struct {
 	Message        string  `json:"message,omitempty"`
 	FromID         string  `json:"fromId,omitempty"`
 	ToID           string  `json:"toId,omitempty"`
+	Funding        *Funding `json:"funding,omitempty"`
+	OpenInterest   *OpenInterest `json:"openInterest,omitempty"`
+}
+
+// Funding 是永续资金费率快照；资金费率只属永续市场，现货帧不填充。
+type Funding struct {
+	Rate           string `json:"rate"`
+	MarkPrice      string `json:"markPrice"`
+	NextFundingAt  int64  `json:"nextFundingAt,omitempty"`
+	Timestamp      int64  `json:"timestamp,omitempty"`
+}
+
+// OpenInterest 是永续未平仓合约量快照，单位为基础资产。
+type OpenInterest struct {
+	Size      string `json:"size"`
+	Timestamp int64  `json:"timestamp,omitempty"`
 }
 
 // NewFrame 填充所有流共用的来源身份；instrumentId 是协议里的稳定身份。
-func NewFrame(kind, symbol string) Frame {
-	return Frame{Type: kind, SourceID: SourceID, Market: Market, Symbol: symbol, InstrumentID: InstrumentID(symbol)}
-}
-
-// instrumentPrefix 品种 ID 的稳定前缀；行情端点按它解析批量参数。
-const instrumentPrefix = SourceID + ":spot:"
-
-// InstrumentID 把交易对转换为协议里的稳定品种 ID。
-func InstrumentID(symbol string) string { return instrumentPrefix + symbol }
-
-// SymbolFromInstrumentID 从协议品种 ID 还原交易对；前缀不匹配时返回 false。
-func SymbolFromInstrumentID(value string) (string, bool) {
-	if !strings.HasPrefix(value, instrumentPrefix) {
-		return "", false
-	}
-	symbol, err := Symbol(strings.TrimPrefix(value, instrumentPrefix))
-	if err != nil {
-		return "", false
-	}
-	return symbol, true
+func NewFrame(kind, market, symbol string) Frame {
+	return Frame{Type: kind, SourceID: SourceID, Market: market, Symbol: symbol, InstrumentID: InstrumentID(market, symbol)}
 }
 
 // LiveBarsFrame 构造实时 K 线帧：身份是 instrumentId，周期属于连接参数。
-func LiveBarsFrame(kind, symbol string) Frame {
-	frame := NewFrame(kind, symbol)
+func LiveBarsFrame(kind, market, symbol string) Frame {
+	frame := NewFrame(kind, market, symbol)
 	frame.Symbol = ""
 	return frame
 }
@@ -123,6 +120,14 @@ func Capabilities() map[string]any {
 		"liveBars":        true, "depth": true,
 		"trades": map[string]any{"recent": true, "historyById": true, "archive": true, "live": true, "raw": true, "aggregated": true, "aggressorSide": "exchange", "volumeUnit": "baseAsset"},
 	}
+}
+
+// PerpCapabilities 在现货能力之上补充永续独有的资金费率与未平仓量。
+func PerpCapabilities() map[string]any {
+	out := Capabilities()
+	out["funding"] = true
+	out["openInterest"] = true
+	return out
 }
 
 // Symbol 规范化交易对，并禁止其改变上游路径和订阅语义。
