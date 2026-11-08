@@ -58,6 +58,7 @@ $env:BINANCE_LIVE_TEST='1'; go test ./internal/binance -run '^TestLive' -v
 | `BINANCE_PERP_ARCHIVE_URL` | `https://data.binance.vision` | 永续历史成交归档 |
 | `BINANCE_CACHE_DIR` | `data/archives` | 归档缓存目录 |
 | `BINANCE_API_KEY` | 空 | 仅现货 `historicalTrades` 可能用到 |
+| `BINANCE_ALLOWED_ORIGINS` | 空 | loopback 之外额外放行的浏览器来源，逗号分隔（如 `https://363045841.github.io`） |
 | `BINANCE_PROXY` | `HTTP(S)_PROXY` → `http://127.0.0.1:6666` | HTTP 与 WS 共用；设为 `direct` 表示直连 |
 | `BINANCE_HTTP_TIMEOUT` | `20s` | REST 超时 |
 | `BINANCE_ARCHIVE_TIMEOUT` | `5m` | 归档下载超时 |

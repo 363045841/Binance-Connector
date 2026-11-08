@@ -192,6 +192,32 @@ func TestSearchMergesMarkets(t *testing.T) {
 	}
 }
 
+// TestCORSAllowlistAndPrivateNetwork 验证白名单来源放行与 PNA 预检允许头。
+func TestCORSAllowlistAndPrivateNetwork(t *testing.T) {
+	s := editMarket(apiSettings(t), model.MarketSpot, func(m *config.MarketSettings) { m.REST = "http://127.0.0.1:1" })
+	s.AllowedOrigins = []string{"https://demo.example"}
+	api := New(binance.New(s), s)
+	defer api.Close()
+
+	allowed := httptest.NewRecorder()
+	allowedRequest := httptest.NewRequest("GET", "/health", nil)
+	allowedRequest.Header.Set("Origin", "https://demo.example")
+	api.ServeHTTP(allowed, allowedRequest)
+	if allowed.Code != 200 || allowed.Header().Get("Access-Control-Allow-Origin") != "https://demo.example" {
+		t.Fatalf("白名单来源未放行: %d %s", allowed.Code, allowed.Body.String())
+	}
+
+	preflight := httptest.NewRecorder()
+	preflightRequest := httptest.NewRequest("OPTIONS", prefix+"/bars", nil)
+	preflightRequest.Header.Set("Origin", "https://demo.example")
+	preflightRequest.Header.Set("Access-Control-Request-Method", "POST")
+	preflightRequest.Header.Set("Access-Control-Request-Private-Network", "true")
+	api.ServeHTTP(preflight, preflightRequest)
+	if preflight.Code != 204 || preflight.Header().Get("Access-Control-Allow-Private-Network") != "true" {
+		t.Fatalf("PNA 预检未放行: %d", preflight.Code)
+	}
+}
+
 // TestSSETradeCatchup 验证官方 WS 格式跨 ID 缺口时先 REST 回补再发布后续成交。
 func TestSSETradeCatchup(t *testing.T) {
 	upgrader := websocket.Upgrader{}
