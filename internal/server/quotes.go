@@ -42,7 +42,10 @@ func (p *quoteProjection) mapEntry(entry stream.Entry) (stream.Entry, bool) {
 	}
 	switch frame.Type {
 	case "snapshot":
-		p.bars[frame.InstrumentID] = tailBars(frame.Bars, quoteBarLimit)
+		// 快照可能只剩一根；按时间戳并入而非覆盖，保留建连时注入的历史基准。
+		for _, bar := range frame.Bars {
+			p.upsert(frame.InstrumentID, bar)
+		}
 	case "forming", "closed":
 		if frame.Bar == nil {
 			return entry, false
@@ -110,6 +113,13 @@ func tailBars(bars []model.Bar, n int) []model.Bar {
 	return append([]model.Bar(nil), bars[len(bars)-n:]...)
 }
 
+// seed 注入历史日线补齐基准；快照不足两根时靠它凑出「最新价 + 昨收」。
+func (p *quoteProjection) seed(instrumentID string, bars []model.Bar) {
+	for _, bar := range bars {
+		p.upsert(instrumentID, bar)
+	}
+}
+
 // liveQuotes 订阅日线实时流并投影成报价帧；现货与永续各自一条订阅。
 func (s *Server) liveQuotes(w http.ResponseWriter, r *http.Request) {
 	instruments, ok := queryInstruments(w, r)
@@ -120,5 +130,15 @@ func (s *Server) liveQuotes(w http.ResponseWriter, r *http.Request) {
 	for i, instrument := range instruments {
 		keys[i] = stream.Key{Market: instrument.Market, Kind: "bars", Symbol: instrument.Symbol, Period: "daily"}
 	}
-	s.sse(w, r, keys, newQuoteProjection().mapEntry)
+	projection := newQuoteProjection()
+	// 日线快照可能只剩一根（永续实测如此）；先用历史补齐基准，
+	// 否则投影凑不出「最新价 + 昨收」，整条连接一帧都不推。
+	for _, instrument := range instruments {
+		bars, err := s.Client.Bars(r.Context(), instrument.Market, instrument.Symbol, "daily", quoteBarLimit, nil)
+		if err != nil {
+			continue
+		}
+		projection.seed(model.InstrumentID(instrument.Market, instrument.Symbol), bars)
+	}
+	s.sse(w, r, keys, projection.mapEntry)
 }
