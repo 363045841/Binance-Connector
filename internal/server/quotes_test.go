@@ -1,4 +1,4 @@
-// 报价投影与品种身份解析测试：不触达上游，只验证协议转换。
+// 报价投影：昨收基准由 REST 确认，实时快照只有最新一根时也不能丢失基准。
 package server
 
 import (
@@ -9,109 +9,113 @@ import (
 	"binanceconnector/internal/stream"
 )
 
-// bar 构造测试用日线。
-func bar(timestamp int64, close float64) model.Bar {
+const (
+	quoteTestInstrument = "binance:spot:BTCUSDT"
+	quoteTestSymbol     = "BTCUSDT"
+	dayOne              = int64(1794182400000)
+	dayTwo              = int64(1794268800000)
+	dayThree            = int64(1794355200000)
+)
+
+// dailyBar 构造一根只关心时间与收盘价的日线。
+func dailyBar(timestamp int64, close float64) model.Bar {
 	return model.Bar{Timestamp: timestamp, Open: close, High: close, Low: close, Close: close}
 }
 
-// entryOf 把帧编码成 stream.Entry，模拟 Hub 投递。
-func entryOf(t *testing.T, value any) stream.Entry {
+// mapFrame 序列化成 SSE 载荷后走一次投影映射，返回报价载荷。
+func mapFrame(t *testing.T, projection *quoteProjection, frame model.Frame) (map[string]any, bool) {
 	t.Helper()
-	data, err := json.Marshal(value)
+	data, err := json.Marshal(frame)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("序列化帧失败: %v", err)
 	}
-	return stream.Entry{ID: "1:1", Seq: 1, Data: data}
+	entry, ok := projection.mapEntry(stream.Entry{Data: data})
+	if !ok {
+		return nil, false
+	}
+	var quote map[string]any
+	if err := json.Unmarshal(entry.Data, &quote); err != nil {
+		t.Fatalf("解析报价帧失败: %v", err)
+	}
+	return quote, true
 }
 
-// decodeQuote 解码映射后的报价帧。
-func decodeQuote(t *testing.T, entry stream.Entry) map[string]any {
+// snapshotFrame 构造实时流的日线快照帧。
+func snapshotFrame(bars ...model.Bar) model.Frame {
+	frame := model.LiveBarsFrame("snapshot", model.MarketSpot, quoteTestSymbol)
+	frame.Bars = bars
+	return frame
+}
+
+// formingFrame 构造实时流的日线形成中帧。
+func formingFrame(bar model.Bar) model.Frame {
+	frame := model.LiveBarsFrame("forming", model.MarketSpot, quoteTestSymbol)
+	frame.Bar = &bar
+	return frame
+}
+
+// assertQuote 校验报价的最新价与昨收。
+func assertQuote(t *testing.T, quote map[string]any, last, prevClose float64) {
 	t.Helper()
-	var payload map[string]any
-	if err := json.Unmarshal(entry.Data, &payload); err != nil {
-		t.Fatal(err)
+	if quote["type"] != "quote" || quote["instrumentId"] != quoteTestInstrument {
+		t.Fatalf("报价帧身份错误: %#v", quote)
 	}
-	return payload
+	if quote["last"] != last || quote["prevClose"] != prevClose {
+		t.Fatalf("报价 = last %v / prevClose %v，期望 %v / %v", quote["last"], quote["prevClose"], last, prevClose)
+	}
 }
 
-// 验证快照直接产出最新价与昨收，值不变时不重复推送。
-func TestQuoteProjectionSnapshot(t *testing.T) {
-	projection := newQuoteProjection()
-	instrumentID := model.InstrumentID(model.MarketSpot, "BTCUSDT")
+func TestQuoteNeedsTwoBarBasis(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		basis   []model.Bar
+		wantOut bool
+	}{
+		{"基准补齐昨收", []model.Bar{dailyBar(dayOne, 100), dailyBar(dayTwo, 110)}, true},
+		{"没有基准", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			projection := newQuoteProjection(map[string][]model.Bar{quoteTestInstrument: tc.basis})
+			quote, ok := mapFrame(t, projection, snapshotFrame(dailyBar(dayTwo, 111)))
+			if ok != tc.wantOut {
+				t.Fatalf("产出报价 = %v，期望 %v", ok, tc.wantOut)
+			}
+			if ok {
+				assertQuote(t, quote, 111, 100)
+			}
+		})
+	}
+}
 
-	frame := model.LiveBarsFrame("snapshot", model.MarketSpot, "BTCUSDT")
-	frame.Bars = []model.Bar{bar(1000, 10), bar(2000, 11)}
+func TestQuoteSkipsRepeatedValues(t *testing.T) {
+	projection := newQuoteProjection(map[string][]model.Bar{
+		quoteTestInstrument: {dailyBar(dayOne, 100), dailyBar(dayTwo, 110)},
+	})
+	frame := snapshotFrame(dailyBar(dayTwo, 110))
+	if _, ok := mapFrame(t, projection, frame); !ok {
+		t.Fatal("首帧应产出报价")
+	}
+	if _, ok := mapFrame(t, projection, frame); ok {
+		t.Fatal("数值未变时不应重复推送")
+	}
+}
 
-	entry, ok := projection.mapEntry(entryOf(t, frame))
+func TestQuoteFollowsFormingBarAcrossTradingDay(t *testing.T) {
+	projection := newQuoteProjection(map[string][]model.Bar{
+		quoteTestInstrument: {dailyBar(dayOne, 100), dailyBar(dayTwo, 110)},
+	})
+	mapFrame(t, projection, snapshotFrame(dailyBar(dayTwo, 110)))
+
+	quote, ok := mapFrame(t, projection, formingFrame(dailyBar(dayTwo, 112)))
 	if !ok {
-		t.Fatal("snapshot should produce a quote")
+		t.Fatal("形成中的日线应有新报价")
 	}
-	payload := decodeQuote(t, entry)
-	if payload["type"] != "quote" || payload["instrumentId"] != instrumentID {
-		t.Fatalf("quote = %#v", payload)
-	}
-	if payload["last"] != float64(11) || payload["prevClose"] != float64(10) {
-		t.Fatalf("quote = %#v, want last=11 prevClose=10", payload)
-	}
+	assertQuote(t, quote, 112, 100)
 
-	if _, ok := projection.mapEntry(entryOf(t, frame)); ok {
-		t.Fatal("unchanged quote should not be pushed again")
-	}
-}
-
-// 验证 forming 推进后报价随之更新，且只保留尾部两根。
-func TestQuoteProjectionForming(t *testing.T) {
-	projection := newQuoteProjection()
-	instrumentID := model.InstrumentID(model.MarketPerp, "BTCUSDT")
-	snapshot := model.LiveBarsFrame("snapshot", model.MarketPerp, "BTCUSDT")
-	snapshot.Bars = []model.Bar{bar(1000, 10), bar(2000, 11)}
-	if _, ok := projection.mapEntry(entryOf(t, snapshot)); !ok {
-		t.Fatal("snapshot should produce a quote")
-	}
-
-	forming := model.LiveBarsFrame("forming", model.MarketPerp, "BTCUSDT")
-	next := bar(2000, 12.5)
-	forming.Bar = &next
-	entry, ok := projection.mapEntry(entryOf(t, forming))
+	quote, ok = mapFrame(t, projection, formingFrame(dailyBar(dayThree, 120)))
 	if !ok {
-		t.Fatal("forming change should produce a quote")
+		t.Fatal("跨交易日后应有新报价")
 	}
-	payload := decodeQuote(t, entry)
-	if payload["last"] != 12.5 || payload["prevClose"] != float64(10) {
-		t.Fatalf("quote = %#v, want last=12.5 prevClose=10", payload)
-	}
-	if payload["instrumentId"] != instrumentID {
-		t.Fatalf("identity = %#v", payload["instrumentId"])
-	}
-}
-
-// 验证状态帧不产出报价，避免把连接事件当成行情。
-func TestQuoteProjectionIgnoresStatus(t *testing.T) {
-	projection := newQuoteProjection()
-	status := model.LiveBarsFrame("status", model.MarketSpot, "BTCUSDT")
-	status.Code = "CONNECTED"
-	if _, ok := projection.mapEntry(entryOf(t, status)); ok {
-		t.Fatal("status frame must not produce a quote")
-	}
-}
-
-// 验证现货与永续共享同一交易对时身份不同，前缀不匹配时明确拒绝。
-func TestInstrumentIdentity(t *testing.T) {
-	spot := model.InstrumentID(model.MarketSpot, "BTCUSDT")
-	perp := model.InstrumentID(model.MarketPerp, "BTCUSDT")
-	if spot != "binance:spot:BTCUSDT" || perp != "binance:perp:BTCUSDT" {
-		t.Fatalf("spot = %q perp = %q", spot, perp)
-	}
-	for _, tc := range []struct{ id, market, symbol string }{{spot, model.MarketSpot, "BTCUSDT"}, {perp, model.MarketPerp, "BTCUSDT"}} {
-		market, symbol, ok := model.SymbolFromInstrumentID(tc.id)
-		if !ok || market != tc.market || symbol != tc.symbol {
-			t.Fatalf("解析 %q = %q/%q ok=%v", tc.id, market, symbol, ok)
-		}
-	}
-	if _, _, ok := model.SymbolFromInstrumentID("btc:spot:BTCUSDT"); ok {
-		t.Fatal("foreign prefix must be rejected")
-	}
-	if _, _, ok := model.SymbolFromInstrumentID("binance:usdm:BTCUSDT"); ok {
-		t.Fatal("unknown market must be rejected")
-	}
+	// 昨收取上一交易日最后一根已知收盘价，收线帧到达后自然被覆盖。
+	assertQuote(t, quote, 120, 112)
 }

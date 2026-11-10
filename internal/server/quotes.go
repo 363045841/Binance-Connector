@@ -1,8 +1,10 @@
-// 报价端点：把日线实时流投影成最新价与昨收，不新增上游订阅路径。
+// 报价端点：把日线实时流投影成最新价与昨收；昨收基准在连接建立时由 REST 确认。
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"binanceconnector/internal/model"
@@ -11,6 +13,9 @@ import (
 
 // quoteBarLimit 只保留尾部窗口：两根用于计算，多留一根给收线后的修订。
 const quoteBarLimit = 3
+
+// quoteBasisSize 报价基准所需的日线根数：今收与昨收，缺一根就算不出涨跌。
+const quoteBasisSize = 2
 
 // quoteMarker 已推送的报价内容；值不变时不重复推送。
 type quoteMarker struct {
@@ -24,9 +29,14 @@ type quoteProjection struct {
 	emitted map[string]quoteMarker
 }
 
-// newQuoteProjection 创建空投影；状态只属于当前连接。
-func newQuoteProjection() *quoteProjection {
-	return &quoteProjection{bars: map[string][]model.Bar{}, emitted: map[string]quoteMarker{}}
+// newQuoteProjection 用连接建立前确认的日线基准初始化投影；状态只属于当前连接。
+// 实时流的快照只保证最新一根，基准必须由此处补齐，否则报价永远发不出来。
+func newQuoteProjection(basis map[string][]model.Bar) *quoteProjection {
+	bars := make(map[string][]model.Bar, len(basis))
+	for instrumentID, tail := range basis {
+		bars[instrumentID] = tailBars(tail, quoteBarLimit)
+	}
+	return &quoteProjection{bars: bars, emitted: map[string]quoteMarker{}}
 }
 
 // mapEntry 把日线帧改写成报价帧；没有新数值时不推送。
@@ -42,7 +52,10 @@ func (p *quoteProjection) mapEntry(entry stream.Entry) (stream.Entry, bool) {
 	}
 	switch frame.Type {
 	case "snapshot":
-		p.bars[frame.InstrumentID] = tailBars(frame.Bars, quoteBarLimit)
+		// 快照只带最新一根时不能覆盖基准，按时间戳合并。
+		for _, bar := range frame.Bars {
+			p.upsert(frame.InstrumentID, bar)
+		}
 	case "forming", "closed":
 		if frame.Bar == nil {
 			return entry, false
@@ -116,9 +129,31 @@ func (s *Server) liveQuotes(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	basis, err := s.quoteBasis(r.Context(), instruments)
+	if err != nil {
+		upstream(w, err)
+		return
+	}
 	keys := make([]stream.Key, len(instruments))
 	for i, instrument := range instruments {
 		keys[i] = stream.Key{Market: instrument.Market, Kind: "bars", Symbol: instrument.Symbol, Period: "daily"}
 	}
-	s.sse(w, r, keys, newQuoteProjection().mapEntry)
+	s.sse(w, r, keys, newQuoteProjection(basis).mapEntry)
+}
+
+// quoteBasis 在连接建立前确认每个品种的今收与昨收；不足两根时显式失败，
+// 而不是让报价通道静默等一个永远不会到来的基准。
+func (s *Server) quoteBasis(ctx context.Context, instruments []marketSymbol) (map[string][]model.Bar, error) {
+	basis := make(map[string][]model.Bar, len(instruments))
+	for _, instrument := range instruments {
+		bars, err := s.Client.Bars(ctx, instrument.Market, instrument.Symbol, "daily", quoteBasisSize, nil)
+		if err != nil {
+			return nil, err
+		}
+		if len(bars) < quoteBasisSize {
+			return nil, fmt.Errorf("%s: 日线只有 %d 根，缺少昨收基准", instrument.Symbol, len(bars))
+		}
+		basis[model.InstrumentID(instrument.Market, instrument.Symbol)] = bars
+	}
+	return basis, nil
 }

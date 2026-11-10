@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -18,23 +19,40 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// TestTradeBudgetError 超限是明确的资源预算错误，不伪装为 Binance 服务不可用。
-func TestTradeBudgetError(t *testing.T) {
-	w := httptest.NewRecorder()
-	upstream(w, &binance.Error{Status: 422, Code: "RESOURCE_EXHAUSTED", Message: "成交范围超过预算"})
-	if w.Code != 422 {
-		t.Fatalf("预算错误状态: %d", w.Code)
-	}
-	var result struct {
-		Error struct {
-			Code string `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
-		t.Fatal(err)
-	}
-	if result.Error.Code != "RESOURCE_EXHAUSTED" {
-		t.Fatalf("预算错误被隐藏: %s", w.Body.String())
+// TestUpstreamErrorMapping 让各类上游错误映射为确定的 HTTP 语义，不被压成统一的 502。
+func TestUpstreamErrorMapping(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"预算超限", &binance.Error{Status: 422, Code: "RESOURCE_EXHAUSTED", Message: "成交范围超过预算"}, 422, "RESOURCE_EXHAUSTED"},
+		{"限频", &binance.Error{Status: 429, Code: "RATE_LIMITED", Message: "Too many requests"}, 429, "RATE_LIMITED"},
+		{"区域受限", &binance.Error{Status: 403, Code: "ACCESS_DENIED", Message: "restricted"}, 403, "ACCESS_DENIED"},
+		{"请求无效", &binance.Error{Status: 400, Code: "INVALID_REQUEST", Message: "bad request"}, 400, "INVALID_REQUEST"},
+		{"上游 404", &binance.Error{Status: 404, Code: "NOT_FOUND", Message: "unknown symbol"}, 404, "NOT_FOUND"},
+		{"超时", context.DeadlineExceeded, 504, "TIMEOUT"},
+		{"其它错误", errors.New("connection refused"), 502, "UPSTREAM_UNAVAILABLE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			upstream(w, tc.err)
+			if w.Code != tc.status {
+				t.Fatalf("状态 = %d，期望 %d: %s", w.Code, tc.status, w.Body.String())
+			}
+			var result struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Error.Code != tc.code {
+				t.Fatalf("错误码 = %q，期望 %q", result.Error.Code, tc.code)
+			}
+		})
 	}
 }
 
@@ -83,13 +101,6 @@ func TestValidationAndCapabilities(t *testing.T) {
 				t.Fatal("缺少追踪 ID")
 			}
 		})
-	}
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/health", nil)
-	req.Header.Set("Origin", "https://unrelated.example")
-	api.ServeHTTP(w, req)
-	if w.Code != 403 {
-		t.Fatal("外部浏览器来源不应默认放行")
 	}
 }
 
@@ -215,6 +226,14 @@ func TestCORSAllowlistAndPrivateNetwork(t *testing.T) {
 	api.ServeHTTP(preflight, preflightRequest)
 	if preflight.Code != 204 || preflight.Header().Get("Access-Control-Allow-Private-Network") != "true" {
 		t.Fatalf("PNA 预检未放行: %d", preflight.Code)
+	}
+
+	blocked := httptest.NewRecorder()
+	blockedRequest := httptest.NewRequest("GET", "/health", nil)
+	blockedRequest.Header.Set("Origin", "https://unrelated.example")
+	api.ServeHTTP(blocked, blockedRequest)
+	if blocked.Code != 403 {
+		t.Fatalf("非白名单来源应拒绝: %d", blocked.Code)
 	}
 }
 
