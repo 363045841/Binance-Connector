@@ -185,15 +185,16 @@ func (c *Client) Bars(ctx context.Context, market, symbol, period string, limit 
 	}
 	result := make([]model.Bar, 0, len(raw))
 	for _, row := range raw {
-		if len(row) < 8 {
+		// Binance K 线固定 12 列；主动买入量在第 10 列（索引 9）
+		if len(row) < 11 {
 			return nil, fmt.Errorf("无效 K 线列数")
 		}
 		var timestamp int64
 		if err := json.Unmarshal(row[0], &timestamp); err != nil {
 			return nil, err
 		}
-		values := make([]float64, 0, 6)
-		for _, i := range []int{1, 2, 3, 4, 5, 7} {
+		values := make([]float64, 0, 7)
+		for _, i := range []int{1, 2, 3, 4, 5, 7, 9} {
 			var text string
 			if err := json.Unmarshal(row[i], &text); err != nil {
 				return nil, err
@@ -204,7 +205,7 @@ func (c *Client) Bars(ctx context.Context, market, symbol, period string, limit 
 			}
 			values = append(values, n)
 		}
-		result = append(result, model.Bar{Timestamp: timestamp, Open: values[0], High: values[1], Low: values[2], Close: values[3], Volume: values[4], Turnover: values[5]})
+		result = append(result, model.Bar{Timestamp: timestamp, Open: values[0], High: values[1], Low: values[2], Close: values[3], Volume: values[4], Turnover: values[5], BuyVolume: &values[6]})
 	}
 	return result, nil
 }

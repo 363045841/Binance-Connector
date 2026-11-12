@@ -14,7 +14,7 @@ const SourceID = "binance"
 var Periods = map[string]string{"1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m", "60min": "1h", "4h": "4h", "daily": "1d", "weekly": "1w", "monthly": "1M"}
 var PeriodNames = []string{"1min", "5min", "15min", "30min", "60min", "4h", "daily", "weekly", "monthly"}
 
-// Bar 为图表 V1 数值 K 线，volume 使用基础资产数量。
+// Bar 为图表 V1 数值 K 线，volume 与 buyVolume 都使用基础资产数量。
 type Bar struct {
 	Timestamp int64   `json:"timestamp"`
 	Open      float64 `json:"open"`
@@ -22,7 +22,10 @@ type Bar struct {
 	Low       float64 `json:"low"`
 	Close     float64 `json:"close"`
 	Volume    float64 `json:"volume"`
-	Turnover  float64 `json:"turnover"`
+	// BuyVolume 是主动买入的基础资产数量，用于精确计算 CVD；
+	// 数据源不提供该字段时保持为空指针，前端据此区分「为 0」与「没有数据」。
+	BuyVolume *float64 `json:"buyVolume,omitempty"`
+	Turnover  float64  `json:"turnover"`
 }
 
 // Trade 保留十进制字符串和字符串 ID，避免前端精度丢失；Side 是主动方向。
