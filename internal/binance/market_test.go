@@ -4,6 +4,7 @@ package binance
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -276,6 +277,73 @@ func TestPerpOnlyCapabilities(t *testing.T) {
 	}
 	if _, err := c.Trades(ctx, "usdm", "BTCUSDT", nil, 1); err == nil {
 		t.Fatal("未知市场必须拒绝")
+	}
+}
+
+// TestInstrumentsClassifiesContracts 验证目录按合约类别分配会话与品种类别：
+// 加密永续与 TradFi 永续各归其类，季度合约、未登记标的类型与非 TRADING 品种不进目录。
+func TestInstrumentsClassifiesContracts(t *testing.T) {
+	const filters = `[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.01"}]`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v3/exchangeInfo":
+			_, _ = fmt.Fprintf(w, `{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":%s}]}`, filters)
+		case "/fapi/v1/exchangeInfo":
+			_, _ = fmt.Fprintf(w, `{"symbols":[
+				{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","contractType":"PERPETUAL","filters":%s},
+				{"symbol":"ANTUSDT","status":"TRADING","baseAsset":"ANT","quoteAsset":"USDT","contractType":"TRADIFI_PERPETUAL","underlyingType":"PREMARKET","underlyingSubType":["Pre-IPO","TradFi"],"filters":%s},
+				{"symbol":"TSLAUSDT","status":"TRADING","baseAsset":"TSLA","quoteAsset":"USDT","contractType":"TRADIFI_PERPETUAL","underlyingType":"EQUITY","underlyingSubType":["TradFi"],"filters":%s},
+				{"symbol":"XAUUSDT","status":"TRADING","baseAsset":"XAU","quoteAsset":"USDT","contractType":"TRADIFI_PERPETUAL","underlyingType":"COMMODITY","underlyingSubType":["TradFi"],"filters":%s},
+				{"symbol":"EURUSDT","status":"TRADING","baseAsset":"EUR","quoteAsset":"USDT","contractType":"TRADIFI_PERPETUAL","underlyingType":"FX","underlyingSubType":["TradFi"],"filters":%s},
+				{"symbol":"WEIRDUSDT","status":"TRADING","baseAsset":"WEIRD","quoteAsset":"USDT","contractType":"TRADIFI_PERPETUAL","underlyingType":"BOND","underlyingSubType":["TradFi"],"filters":%s},
+				{"symbol":"BTCUSDT_260327","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","contractType":"CURRENT_QUARTER","filters":[]},
+				{"symbol":"ANTHROPICUSDT","status":"SETTLING","baseAsset":"ANTHROPIC","quoteAsset":"USDT","contractType":"TRADIFI_PERPETUAL","underlyingType":"PREMARKET","filters":[]}
+			]}`, filters, filters, filters, filters, filters, filters)
+		default:
+			t.Errorf("意外路径: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	s := withREST(settingsForTest(t), model.MarketSpot, up.URL)
+	s = withREST(s, model.MarketPerp, up.URL)
+	c := New(s)
+	defer c.Close()
+	ctx := context.Background()
+
+	spot, err := c.Instruments(ctx, model.MarketSpot)
+	if err != nil || len(spot) != 1 || spot[0].SessionID != model.SessionSpot || spot[0].InstrumentType != model.InstrumentTypeCrypto {
+		t.Fatalf("现货目录应只含 crypto: %+v %v", spot, err)
+	}
+	perp, err := c.Instruments(ctx, model.MarketPerp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bySymbol := make(map[string]model.Instrument, len(perp))
+	for _, item := range perp {
+		bySymbol[item.Symbol] = item
+	}
+	for _, tc := range []struct {
+		symbol, sessionID, instrumentType, name string
+	}{
+		{"BTCUSDT", model.SessionPerp, model.InstrumentTypeCrypto, "BTC / USDT"},
+		{"ANTUSDT", model.SessionPerp, model.InstrumentTypeStock, "ANT / USDT · Pre-IPO"},
+		{"TSLAUSDT", model.SessionPerp, model.InstrumentTypeStock, "TSLA / USDT"},
+		{"XAUUSDT", model.SessionPerp, model.InstrumentTypeFuture, "XAU / USDT"},
+		{"EURUSDT", model.SessionPerp, model.InstrumentTypeForex, "EUR / USDT"},
+	} {
+		item, ok := bySymbol[tc.symbol]
+		if !ok {
+			t.Fatalf("永续目录缺少 %s: %+v", tc.symbol, bySymbol)
+		}
+		if item.ID != "binance:perp:"+tc.symbol || item.SessionID != tc.sessionID || item.InstrumentType != tc.instrumentType || item.Name != tc.name {
+			t.Fatalf("%s 分类错误: %+v", tc.symbol, item)
+		}
+	}
+	for _, excluded := range []string{"WEIRDUSDT", "BTCUSDT_260327", "ANTHROPICUSDT"} {
+		if item, ok := bySymbol[excluded]; ok {
+			t.Fatalf("%s 不应进目录: %+v", excluded, item)
+		}
 	}
 }
 

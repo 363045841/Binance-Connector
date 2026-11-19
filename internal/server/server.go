@@ -270,11 +270,11 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 		}
 		markets = []string{body.Market}
 	}
+	// 类别过滤按源真正提供的类别求交集：本源没有请求的类别时返回空列表，
+	// 既不把「本源没有该类别」当成错误，也不跳过过滤把其他类别塞回结果。
+	allowed := make(map[string]struct{}, len(body.InstrumentTypes))
 	for _, instrumentType := range body.InstrumentTypes {
-		if instrumentType != "crypto" {
-			success(w, map[string]any{"items": []model.Instrument{}})
-			return
-		}
+		allowed[instrumentType] = struct{}{}
 	}
 	keyword := strings.ToUpper(strings.TrimSpace(body.Keyword))
 	matches := make([]model.Instrument, 0, body.Limit*len(markets))
@@ -285,6 +285,10 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, item := range items {
+			_, allowedType := allowed[item.InstrumentType]
+			if len(allowed) > 0 && !allowedType {
+				continue
+			}
 			if strings.Contains(item.Symbol, keyword) || strings.Contains(strings.ToUpper(item.Name), keyword) {
 				matches = append(matches, item)
 			}

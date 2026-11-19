@@ -135,6 +135,34 @@ func TestInstrumentMarketResolution(t *testing.T) {
 	}
 }
 
+// searchItems 经真实 handler 搜索品种目录并解包 items，失败即终止用例。
+func searchItems(t *testing.T, api *Server, body string) []model.Instrument {
+	t.Helper()
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, httptest.NewRequest("POST", prefix+"/instruments/search", strings.NewReader(body)))
+	if w.Code != 200 {
+		t.Fatalf("搜索失败: %d %s", w.Code, w.Body.String())
+	}
+	var envelope struct {
+		Data struct {
+			Items []model.Instrument `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	return envelope.Data.Items
+}
+
+// instrumentIDs 提取目录条目的稳定 ID，用于断言顺序与截断结果。
+func instrumentIDs(items []model.Instrument) []string {
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		out = append(out, item.ID)
+	}
+	return out
+}
+
 // TestSearchMergesMarkets 验证搜索省略 market 时合并现货与永续目录：
 // 同一代码在两个市场各返回一条独立身份，显式声明 market 时只返回该市场。
 func TestSearchMergesMarkets(t *testing.T) {
@@ -155,44 +183,21 @@ func TestSearchMergesMarkets(t *testing.T) {
 	s = editMarket(s, model.MarketPerp, func(m *config.MarketSettings) { m.REST = up.URL })
 	api := New(binance.New(s), s)
 	defer api.Close()
-	search := func(body string) []model.Instrument {
-		w := httptest.NewRecorder()
-		api.ServeHTTP(w, httptest.NewRequest("POST", prefix+"/instruments/search", strings.NewReader(body)))
-		if w.Code != 200 {
-			t.Fatalf("搜索失败: %d %s", w.Code, w.Body.String())
-		}
-		var envelope struct {
-			Data struct {
-				Items []model.Instrument `json:"items"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
-			t.Fatal(err)
-		}
-		return envelope.Data.Items
-	}
-	ids := func(items []model.Instrument) []string {
-		out := make([]string, 0, len(items))
-		for _, item := range items {
-			out = append(out, item.ID)
-		}
-		return out
-	}
 	// 省略 market 时两个市场都搜，同代码现货在前（与「不带后缀即现货」一致）。
-	if got := strings.Join(ids(search(`{"sourceId":"binance","keyword":"BTCUSDT","limit":10}`)), ","); got != "binance:spot:BTCUSDT,binance:perp:BTCUSDT" {
+	if got := strings.Join(instrumentIDs(searchItems(t, api, `{"sourceId":"binance","keyword":"BTCUSDT","limit":10}`)), ","); got != "binance:spot:BTCUSDT,binance:perp:BTCUSDT" {
 		t.Fatalf("跨市场搜索应同时返回现货与永续，实际 %s", got)
 	}
 	// 显式限定市场时只返回该市场。
-	if got := strings.Join(ids(search(`{"sourceId":"binance","keyword":"BTCUSDT","market":"perp","limit":10}`)), ","); got != "binance:perp:BTCUSDT" {
+	if got := strings.Join(instrumentIDs(searchItems(t, api, `{"sourceId":"binance","keyword":"BTCUSDT","market":"perp","limit":10}`)), ","); got != "binance:perp:BTCUSDT" {
 		t.Fatalf("限定永续市场不应返回现货，实际 %s", got)
 	}
 	// 截断发生在合并之后：limit=2 时两个市场的 BTCUSDT 都在，不会被截掉其中一个。
-	if got := strings.Join(ids(search(`{"sourceId":"binance","keyword":"BTCUSDT","limit":2}`)), ","); got != "binance:spot:BTCUSDT,binance:perp:BTCUSDT" {
+	if got := strings.Join(instrumentIDs(searchItems(t, api, `{"sourceId":"binance","keyword":"BTCUSDT","limit":2}`)), ","); got != "binance:spot:BTCUSDT,binance:perp:BTCUSDT" {
 		t.Fatalf("截断必须在合并之后，实际 %s", got)
 	}
 	// 合并后按代码排序再截断：limit=3 时 AAAUSDT 的现货与永续都出现，
 	// 说明名额没有被现货目录占满（先拼现货再截断会漏掉永续）。
-	if got := strings.Join(ids(search(`{"sourceId":"binance","keyword":"","limit":3}`)), ","); got != "binance:spot:AAAUSDT,binance:perp:AAAUSDT,binance:spot:BBBUSDT" {
+	if got := strings.Join(instrumentIDs(searchItems(t, api, `{"sourceId":"binance","keyword":"","limit":3}`)), ","); got != "binance:spot:AAAUSDT,binance:perp:AAAUSDT,binance:spot:BBBUSDT" {
 		t.Fatalf("截断前必须按代码排序，实际 %s", got)
 	}
 	// 未知市场仍然显式拒绝，不退化成跨市场搜索。
@@ -200,6 +205,43 @@ func TestSearchMergesMarkets(t *testing.T) {
 	api.ServeHTTP(w, httptest.NewRequest("POST", prefix+"/instruments/search", strings.NewReader(`{"sourceId":"binance","keyword":"BTCUSDT","market":"usdm","limit":10}`)))
 	if w.Code != 400 {
 		t.Fatalf("未知市场应拒绝，实际 %d", w.Code)
+	}
+}
+
+// TestSearchTradFiPerpetual 验证 TradFi 永续进入目录后能被搜到，
+// 且 instrumentTypes 按真实类别过滤，不再把非 crypto 请求整体返回空列表。
+func TestSearchTradFiPerpetual(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v3/exchangeInfo":
+			_, _ = w.Write([]byte(`{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.00001"}]}]}`))
+		case "/fapi/v1/exchangeInfo":
+			_, _ = w.Write([]byte(`{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","contractType":"PERPETUAL","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001"}]},{"symbol":"ANTUSDT","status":"TRADING","baseAsset":"ANT","quoteAsset":"USDT","contractType":"TRADIFI_PERPETUAL","underlyingType":"PREMARKET","underlyingSubType":["Pre-IPO","TradFi"],"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.01"}]}]}`))
+		default:
+			t.Errorf("意外路径: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	s := editMarket(apiSettings(t), model.MarketSpot, func(m *config.MarketSettings) { m.REST = up.URL })
+	s = editMarket(s, model.MarketPerp, func(m *config.MarketSettings) { m.REST = up.URL })
+	api := New(binance.New(s), s)
+	defer api.Close()
+
+	// Pre-IPO 永续按 stock 归类并落在永续市场会话上。
+	items := searchItems(t, api, `{"sourceId":"binance","keyword":"ANTUSDT","limit":10}`)
+	if len(items) != 1 || items[0].ID != "binance:perp:ANTUSDT" || items[0].InstrumentType != model.InstrumentTypeStock || items[0].SessionID != model.SessionPerp {
+		t.Fatalf("Pre-IPO 永续目录错误: %+v", items)
+	}
+	// 请求 stock 时返回该类品种；请求 crypto 时不混入 TradFi；请求本源没有的类别返回空。
+	if got := strings.Join(instrumentIDs(searchItems(t, api, `{"sourceId":"binance","keyword":"","limit":10,"instrumentTypes":["stock"]}`)), ","); got != "binance:perp:ANTUSDT" {
+		t.Fatalf("stock 过滤结果错误: %s", got)
+	}
+	if got := strings.Join(instrumentIDs(searchItems(t, api, `{"sourceId":"binance","keyword":"","limit":10,"instrumentTypes":["crypto"]}`)), ","); got != "binance:spot:BTCUSDT,binance:perp:BTCUSDT" {
+		t.Fatalf("crypto 过滤结果错误: %s", got)
+	}
+	if got := instrumentIDs(searchItems(t, api, `{"sourceId":"binance","keyword":"","limit":10,"instrumentTypes":["option"]}`)); len(got) != 0 {
+		t.Fatalf("本源没有的类别应返回空列表: %v", got)
 	}
 }
 

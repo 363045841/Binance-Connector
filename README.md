@@ -6,7 +6,7 @@ Binance 行情 Connector，为 KlineChartQuant 提供现货与 USDT-M 永续的 
 
 - 语言：Go 1.24（单 module）
 - 默认监听：`127.0.0.1:8091`
-- 市场：`spot`（现货）与 `perp`（USDⓈ-M 永续；COIN-M 与季度合约未实现）
+- 市场：`spot`（现货）与 `perp`（USDⓈ-M 永续，含加密永续与 TradFi 永续；COIN-M 与季度合约未实现）
 - 协议：`/api/v1/market-data`（V1 风格 envelope），另有 `/health`
 
 ## 品种标识
@@ -91,8 +91,9 @@ $env:BINANCE_LIVE_TEST='1'; go test ./internal/binance -run '^TestLive' -v
 
 `market` 缺省为「全部市场」：搜索结果合并 `spot` 与 `perp`，同一代码返回两条独立身份
 （`binance:spot:BTCUSDT` 与 `binance:perp:BTCUSDT`），这样不加后缀也能搜到永续；
-显式声明 `market` 时只搜该市场。`/funding` 与 `/open-interest` 在现货上返回 `UNSUPPORTED_CAPABILITY`，
-不返回空数组。
+显式声明 `market` 时只搜该市场。`instrumentTypes` 按目录里的真实类别
+（`crypto` / `stock` / `future` / `forex`）过滤，请求本源没有的类别返回空数组。
+`/funding` 与 `/open-interest` 在现货上返回 `UNSUPPORTED_CAPABILITY`，不返回空数组。
 
 成功返回 `{"data":...,"requestId":...}`，失败返回 `{"error":{"code","message"},"requestId"}`。
 
@@ -125,8 +126,9 @@ internal/server/         — HTTP/SSE/NDJSON 路由与 envelope
 
 ## 未完成（后续工作）
 
-- **COIN-M 与季度合约**：只实现 USDⓈ-M `PERPETUAL`。`TRADIFI_PERPETUAL`（黄金、股票等
-  传统资产永续）暂不纳入，因其交易时段与加密不同，需先有会话模型支持。
+- **COIN-M 与季度合约**：只实现 USDⓈ-M 永续，其中加密永续（`PERPETUAL`）与 TradFi 永续
+  （`TRADIFI_PERPETUAL`：股票、商品、外汇、Pre-IPO）都进目录。TradFi 永续实测 24×7 连续成交，
+  复用 `BINANCE_PERP` 会话；`underlyingType` 未登记的组合不进目录，不猜类别。
 - **永续原始成交深历史**：`/fapi/v1/trades` 忽略 `fromId`，`/fapi/v1/historicalTrades`
   需签名，故 `raw` 不支持按 ID 回补；如需深历史请用 `aggregated` 或归档。
 - **按 ID 深历史（现货）**：`historicalTrades` 依赖 `api.binance.com`，本网络需代理；无代理时

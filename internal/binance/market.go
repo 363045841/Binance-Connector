@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"time"
 
@@ -253,10 +254,12 @@ func (c *Client) Depth(ctx context.Context, market, symbol string, limit int) (D
 	return snap, err
 }
 
-// exchangeEntry 是现货与永续共有的目录字段；永续额外带 contractType 与结算资产。
+// exchangeEntry 是现货与永续共有的目录字段；永续额外带合约类别、标的类型与结算资产。
 type exchangeEntry struct {
 	Symbol, Status, BaseAsset, QuoteAsset, MarginAsset string
 	ContractType                                       string
+	UnderlyingType                                     string
+	UnderlyingSubType                                  []string
 	Filters                                            []struct {
 		Type string `json:"filterType"`
 		Tick string `json:"tickSize"`
@@ -265,8 +268,8 @@ type exchangeEntry struct {
 }
 
 // Instruments 返回市场的品种目录；目录缓存按市场隔离并小时级复用，
-// 首个上游错误不会写入缓存。永续只收录 crypto 永续（PERPETUAL），
-// 传统资产永续（TRADIFI_PERPETUAL）交易时段与加密不同，待会话模型支持后再纳入。
+// 首个上游错误不会写入缓存。永续按合约类别分类：加密永续与 TradFi 永续都进目录，
+// 会话与品种类别由 model.InstrumentClass 统一决定；季度合约与未登记的标的类型不进目录。
 func (c *Client) Instruments(ctx context.Context, market string) ([]model.Instrument, error) {
 	spec, ok := marketEndpoints(market)
 	if !ok {
@@ -301,8 +304,14 @@ func (c *Client) Instruments(ctx context.Context, market string) ([]model.Instru
 		if s.Status != "TRADING" {
 			continue
 		}
-		if market == model.MarketPerp && s.ContractType != "PERPETUAL" {
-			continue
+		sessionID, instrumentType := model.SessionSpot, model.InstrumentTypeCrypto
+		if market == model.MarketPerp {
+			// 永续目录按合约类别分类；未登记的组合（季度合约、未知标的类型）不进目录。
+			var ok bool
+			sessionID, instrumentType, ok = model.InstrumentClass(s.ContractType, s.UnderlyingType)
+			if !ok {
+				continue
+			}
 		}
 		if _, err := model.Symbol(s.Symbol); err != nil {
 			continue
@@ -327,20 +336,27 @@ func (c *Client) Instruments(ctx context.Context, market string) ([]model.Instru
 			continue
 		}
 		capabilities := model.Capabilities()
-		session := "BINANCE_SPOT"
 		if market == model.MarketPerp {
 			capabilities = model.PerpCapabilities()
-			session = "BINANCE_PERP"
 		}
 		result = append(result, model.Instrument{
-			ID: id, SourceID: model.SourceID, Symbol: s.Symbol, Name: s.BaseAsset + " / " + s.QuoteAsset,
-			InstrumentType: "crypto", Exchange: "BINANCE", SessionID: session, Currency: s.QuoteAsset,
+			ID: id, SourceID: model.SourceID, Symbol: s.Symbol, Name: instrumentName(s),
+			InstrumentType: instrumentType, Exchange: "BINANCE", SessionID: sessionID, Currency: s.QuoteAsset,
 			TickSize: tick, LotSize: lot,
 			ProviderRef:  map[string]string{"symbol": s.Symbol, "market": market},
 			Capabilities: capabilities,
 		})
 	}
 	return result, nil
+}
+
+// instrumentName 生成展示名；Pre-IPO 永续与同名加密资产在搜索里容易混淆，标注标的来源。
+func instrumentName(entry exchangeEntry) string {
+	name := entry.BaseAsset + " / " + entry.QuoteAsset
+	if slices.Contains(entry.UnderlyingSubType, "Pre-IPO") {
+		name += " · Pre-IPO"
+	}
+	return name
 }
 
 // fundingEndpoints 返回永续专属端点；市场参数是显式的，现货调用直接拒绝而不发网络请求。

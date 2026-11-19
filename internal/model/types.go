@@ -113,9 +113,11 @@ type Instrument struct {
 }
 
 // Capabilities 明确区分报价与真实成交，历史归档与实时分页均公开声明。
+// instrumentTypes 描述整个源（现货 + 永续）覆盖的类别：前端能力清单按源保存，
+// 且探针默认打到现货，少声明一类就会让该类别的品种在路由阶段被挡掉。
 func Capabilities() map[string]any {
 	return map[string]any{
-		"instrumentTypes": []string{"crypto"},
+		"instrumentTypes": InstrumentTypes(),
 		"bars":            map[string]any{"periods": PeriodNames, "adjustments": []string{"none"}, "barAggregations": []string{"original"}},
 		"liveBars":        true, "depth": true,
 		"trades": map[string]any{"recent": true, "historyById": true, "archive": true, "live": true, "raw": true, "aggregated": true, "aggressorSide": "exchange", "volumeUnit": "baseAsset"},

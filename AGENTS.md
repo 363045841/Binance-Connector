@@ -35,7 +35,7 @@ $env:BINANCE_LIVE_TEST='1'; go test ./internal/binance -run '^TestLive' -v
 | 包 | 职责 |
 |---|---|
 | `internal/config` | 配置与校验：按市场分组的 REST/历史/WS/归档地址与权重预算（含 `BINANCE_PROXY`，默认 `127.0.0.1:6666`） |
-| `internal/model` | V1 契约：`Bar` / `Trade` / `Level` / `Frame` / `Instrument` / `Funding` / `OpenInterest`，以及市场与品种 ID 的唯一定义（`markets.go`） |
+| `internal/model` | V1 契约：`Bar` / `Trade` / `Level` / `Frame` / `Instrument` / `Funding` / `OpenInterest`，以及市场与品种 ID 的唯一定义（`markets.go`）、合约类别到会话与品种类别的映射（`contracts.go`） |
 | `internal/binance` | REST、WebSocket、盘口同步、归档、出口限流 |
 | `internal/stream` | 共享订阅 Hub：回放、背压、空闲回收 |
 | `internal/server` | HTTP / SSE / NDJSON 路由与 envelope |
@@ -75,8 +75,11 @@ USDⓈ-M 永续的 WS 已按流类型拆分前缀，旧的 `wss://fstream.binanc
 
 ## 已知限制
 
-- 永续只覆盖 USDⓈ-M `PERPETUAL`；`TRADIFI_PERPETUAL`（黄金、股票等传统资产永续）与
-  COIN-M、季度合约均未实现——前者交易时段与加密不同，需先有会话模型支持。
+- 永续覆盖 USDⓈ-M 全部加密永续（`PERPETUAL`）与 TradFi 永续（`TRADIFI_PERPETUAL`：
+  股票、商品、外汇、Pre-IPO）。类别与会话由 `internal/model/contracts.go` 的
+  `InstrumentClass` 唯一决定；`underlyingType` 未登记的组合直接不进目录，不猜类别。
+  TradFi 永续实测 24×7 连续成交，复用 `BINANCE_PERP` 会话。COIN-M、季度合约与
+  `SETTLING` 状态品种未实现。
 - 永续原始成交（`raw`）不支持按 ID 深历史：`/fapi/v1/trades` 忽略 `fromId`，
   `/fapi/v1/historicalTrades` 需签名。按 ID 回补请改用 `aggregated` 或归档。
 - 永续归档为七列带表头、时间戳毫秒；现货为八列无表头、2025-01-01 起微秒。
